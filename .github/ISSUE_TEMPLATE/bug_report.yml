@@ -25,7 +25,7 @@ body:
     id: mw5-source
     attributes:
       label: MW5 installation source
-      description: Where is your MechWarrior 5: Mercenaries installation from?
+      description: "Where is your MechWarrior 5: Mercenaries installation from?"
       options:
         - Steam
         - Epic Games Store

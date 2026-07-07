@@ -1,5 +1,2 @@
 blank_issues_enabled: false
-contact_links:
-  - name: Report a security vulnerability
-    url: https://github.com/FiendishDrWu/Scarab/security/advisories
-    about: Report suspected security vulnerabilities privately. Do not open a public issue.
+contact_links: []
