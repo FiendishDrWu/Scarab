@@ -1,6 +1,7 @@
 name: Bug report
 description: Report a reproducible problem with Scarab
 title: "[Bug] "
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
@@ -8,6 +9,8 @@ body:
         Thanks for reporting a Scarab problem.
 
         Please provide enough information to reproduce the issue. Do not upload copyrighted MW5 game assets, complete commercial game pak files, or mod files you do not have permission to redistribute.
+
+        Suspected security vulnerabilities should be reported privately through the Security link in the issue chooser instead of as a public bug report.
 
   - type: input
     id: scarab-version
@@ -112,6 +115,8 @@ body:
         - label: I searched existing issues for the same problem.
           required: true
         - label: I am reporting a Scarab problem, not a general MW5, save-editor, or mod support question.
+          required: true
+        - label: I am not using this public issue form to disclose a suspected security vulnerability.
           required: true
         - label: I have not attached copyrighted MW5 game assets, complete commercial game pak files, or third-party mod files that I do not have permission to redistribute.
           required: true
