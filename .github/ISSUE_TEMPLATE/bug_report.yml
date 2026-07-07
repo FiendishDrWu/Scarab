@@ -1,0 +1,117 @@
+name: Bug report
+description: Report a reproducible problem with Scarab
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Scarab problem.
+
+        Please provide enough information to reproduce the issue. Do not upload copyrighted MW5 game assets, complete commercial game pak files, or mod files you do not have permission to redistribute.
+
+  - type: input
+    id: scarab-version
+    attributes:
+      label: Scarab version
+      description: Which Scarab version are you using?
+      placeholder: "Example: 1.7.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mw5-source
+    attributes:
+      label: MW5 installation source
+      description: Where is your MechWarrior 5: Mercenaries installation from?
+      options:
+        - Steam
+        - Epic Games Store
+        - Other
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mods-involved
+    attributes:
+      label: Are mods involved?
+      description: Is the problem related to scanning one or more enabled mods?
+      options:
+        - "No"
+        - "Yes"
+        - "Unknown"
+    validations:
+      required: true
+
+  - type: textarea
+    id: mod-details
+    attributes:
+      label: Relevant mod details
+      description: If mods are involved, identify the mod or mods and any relevant load-order information. Do not upload mod files unless you have permission to redistribute them.
+      placeholder: "Mod name, version, source page, load-order details, or other relevant information."
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or invocation
+      description: Provide the Scarab command and options used. You may redact unrelated local path details, but preserve enough of the command to reproduce the behavior.
+      placeholder: '.\scarab.exe --mw5-dir "D:\MW5 Mercs\MW5Mercs" --output jj-catalog'
+      render: powershell
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior, including any error message or unexpected catalog result.
+      placeholder: "Describe what Scarab did."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: What did you expect?
+      description: Describe the result you expected instead.
+      placeholder: "Describe the expected behavior."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide the shortest reliable sequence that reproduces the problem.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: upload
+    id: build-report
+    attributes:
+      label: catalog_build_report.json
+      description: Upload the catalog_build_report.json produced by the failing run when available. If Scarab failed before creating a report, leave this empty.
+    validations:
+      required: false
+      accept: ".json"
+
+  - type: textarea
+    id: console-output
+    attributes:
+      label: Relevant console output
+      description: Paste any relevant Scarab console output or error text. Do not include secrets, credentials, or unrelated personal information.
+      render: text
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I am reporting a Scarab problem, not a general MW5, save-editor, or mod support question.
+          required: true
+        - label: I have not attached copyrighted MW5 game assets, complete commercial game pak files, or third-party mod files that I do not have permission to redistribute.
+          required: true

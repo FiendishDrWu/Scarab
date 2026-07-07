@@ -1,0 +1,63 @@
+name: Feature request
+description: Suggest a focused improvement to Scarab
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Scarab is intentionally focused on generating asset catalogs for JJ's MechWarrior 5: Mercenaries Save Editor.
+
+        It is not intended to become a general pak explorer, asset browser, or standalone save editor.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the catalog-generation problem or limitation you are trying to address.
+      placeholder: "Explain the user or integration problem before describing the solution."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe what you would like Scarab to do.
+      placeholder: "Describe the desired behavior as concretely as possible."
+    validations:
+      required: true
+
+  - type: textarea
+    id: jj-editor-value
+    attributes:
+      label: How would this help JJ's editor or Scarab catalog generation?
+      description: Explain how the request improves Scarab's catalog output, MW5 asset discovery, or integration with JJ's editor.
+      placeholder: "Describe the practical catalog or editor integration benefit."
+    validations:
+      required: true
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Examples or supporting information
+      description: Provide examples, relevant asset types, public mod links, or format details that help explain the request. Do not upload copyrighted MW5 assets or third-party mod files without permission.
+      placeholder: "Optional examples, references, or technical context."
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you worked around this another way? Is there a simpler behavior that would solve the same problem?
+      placeholder: "Optional."
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues for the same or a substantially similar request.
+          required: true
+        - label: I understand Scarab is focused on asset catalog generation for JJ's editor and is not intended to become a general pak explorer, asset browser, or standalone save editor.
+          required: true
+        - label: I have not attached copyrighted MW5 game assets or third-party mod files that I do not have permission to redistribute.
+          required: true
