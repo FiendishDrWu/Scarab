@@ -6,9 +6,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a Scarab problem.
+        Thanks for reporting a Scarab problem. Please provide enough information to reproduce the issue.
 
-        Please provide enough information to reproduce the issue. Do not upload copyrighted MW5 game assets, complete commercial game pak files, or mod files you do not have permission to redistribute.
+        Do not upload copyrighted MW5 game assets, complete commercial game pak files, or mod files you do not have permission to redistribute.
 
         Suspected security vulnerabilities should be reported privately through the Security link in the issue chooser instead of as a public bug report.
 
@@ -17,7 +17,7 @@ body:
     attributes:
       label: Scarab version
       description: Which Scarab version are you using?
-      placeholder: "Example: 1.7.1"
+      placeholder: "Example: 1.7.3"
     validations:
       required: true
 
@@ -50,14 +50,17 @@ body:
     id: mod-details
     attributes:
       label: Relevant mod details
-      description: If mods are involved, identify the mod or mods and any relevant load-order information. Do not upload mod files unless you have permission to redistribute them.
+      description: |
+        If mods are involved, identify the mod or mods and any relevant load-order information.
+        Do not upload mod files unless you have permission to redistribute them.
       placeholder: "Mod name, version, source page, load-order details, or other relevant information."
 
   - type: textarea
     id: command
     attributes:
       label: Command or invocation
-      description: Provide the Scarab command and options used. You may redact unrelated local path details, but preserve enough of the command to reproduce the behavior.
+      description: |
+        Provide the Scarab command and options used. You may redact unrelated local path details, but preserve enough of the command to reproduce the behavior.
       placeholder: '.\scarab.exe --mw5-dir "D:\MW5 Mercs\MW5Mercs" --output jj-catalog'
       render: powershell
 
@@ -95,7 +98,8 @@ body:
     id: build-report
     attributes:
       label: catalog_build_report.json
-      description: Upload the catalog_build_report.json produced by the failing run when available. If Scarab failed before creating a report, leave this empty.
+      description: |
+        The build report is off by default. If practical, rerun the failing operation with --build-report and upload the resulting catalog_build_report.json. If Scarab fails before a report can be created, leave this empty.
     validations:
       required: false
       accept: ".json"
