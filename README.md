@@ -20,7 +20,7 @@
 
 Scarab is a standalone Windows utility that generates asset catalogs for [JJ's MechWarrior 5: Mercenaries Save Editor](https://github.com/jonayetjubaer-cmyk/JJs-MW5-Merc-Save-Editor).
 
-It reads a local MechWarrior 5: Mercenaries installation, discovers the base-game assets and mods enabled by the game, and generates catalogs describing available items, mechs, stock mech templates, and traits.
+It reads a local MechWarrior 5: Mercenaries installation, discovers the base-game assets and mods enabled by the game, and generates catalogs describing available items, mechs, stock mech templates, and traits. Stock mech templates also include chassis maximum armor values derived from the game assets.
 
 Scarab is designed primarily as a catalog-generation backend for JJ's editor. It may also be run directly.
 
