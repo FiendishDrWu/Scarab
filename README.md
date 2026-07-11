@@ -43,7 +43,8 @@ The release contains three Scarab publication assets:
 Download `scarab.exe` to a location where it is allowed to create its output directory.
 
 > [!NOTE]
-> JJ editor users should use the Scarab release specifically supported by the editor. Scarab and JJ's editor may release on different schedules, so the newest Scarab release is not automatically the correct backend for every editor build.
+> JJ's MW5 Save Editor users should use the Scarab release specifically supported by the editor. Scarab and JJ's editor may release on different schedules, so the newest Scarab release is not automatically the correct backend for every editor build.
+> JJ's MW5 SAVE EDITOR USERS DO NOT NEED TO READ ANY FURTHER. The save editor handles all of the Scarab commands for you behind the scenes.
 
 ## Usage
 
