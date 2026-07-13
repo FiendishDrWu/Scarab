@@ -20,9 +20,20 @@
 
 Scarab is a standalone Windows asset catalog generator for MechWarrior 5: Mercenaries, designed for save editor developers, mod developers, and other users who need structured MW5 asset data.
 
-It reads a local MechWarrior 5: Mercenaries installation, discovers the base-game assets and mods enabled by the game, and generates catalogs describing available items, mechs, stock mech templates, and traits. Stock mech templates also include chassis maximum armor values derived from the game assets.
+It reads a local MechWarrior 5: Mercenaries installation, discovers the base-game assets and mods enabled by the game, including enabled Steam Workshop mods when present, and generates catalogs describing available items, mechs, stock mech templates, and traits. Stock mech templates also include chassis maximum armor values derived from the game assets.
 
 Scarab is designed primarily as a catalog-generation backend for save game editors like [JJ's MechWarrior 5: Mercenaries Save Editor](https://github.com/jonayetjubaer-cmyk/JJs-MW5-Merc-Save-Editor). It may also be run directly.
+
+## Scarab v1.7.6
+
+Scarab v1.7.6 adds automatic support for enabled MechWarrior 5 mods installed through the Steam Workshop.
+
+- Scarab continues to read enabled-mod state and load order from MW5's normal `MW5Mercs\Mods\modlist.json`.
+- When the supplied game directory is inside a Steam library, Scarab also derives and checks `steamapps\workshop\content\784080` as an optional second mod root.
+- Workshop mods use the same existing `mod.json`, pak discovery, load-order, exclusion, and catalog-merging behavior as manually installed mods.
+- A missing Workshop directory is normal and is ignored without error, so Epic Games Store and non-Workshop installations are unaffected.
+- No Steam API access, Steam account access, or additional command-line configuration is required.
+
 
 ## Download
 
@@ -64,7 +75,7 @@ Example:
 .\scarab.exe --mw5-dir "D:\MW5 Mercs\MW5Mercs" --output jj-catalog
 ```
 
-Scarab discovers the base-game pak and Mods directory from the supplied MW5 game directory.
+Scarab discovers the base-game pak, the normal MW5 Mods directory, and an optional Steam Workshop mod directory from the supplied MW5 game directory.
 
 `--output` must be a relative path. The generated output directory is created relative to the directory containing `scarab.exe`.
 
@@ -256,9 +267,23 @@ Without `--catalog-input-dir`, Scarab includes the MW5 base-game pak unless `--e
 
 Scarab includes mods unless `--exclude-mods` is supplied.
 
-For mods, Scarab reads MW5's `modlist.json` and includes only mods the game currently marks as enabled.
+For mods, Scarab reads MW5's normal `MW5Mercs\Mods\modlist.json` and includes only mods the game currently marks as enabled. The same enabled-mod list is used for both manually installed mods and Steam Workshop mods.
 
-For each included mod, Scarab reads its `mod.json` load order and scans mod paks in merge order.
+Scarab first resolves each enabled mod beneath the normal MW5 Mods directory. A typical installation uses:
+
+```text
+<MW5 installation>\MW5Mercs\Mods\<mod folder>
+```
+
+When the supplied MW5 game directory is inside a Steam library, Scarab also derives and checks the optional Workshop directory:
+
+```text
+<Steam library>\steamapps\workshop\content\784080\<Workshop item ID>
+```
+
+The normal MW5 Mods directory is checked first. If the Workshop directory does not exist, Scarab continues normally; no Steam installation, Steam API access, or additional configuration is required.
+
+For each included mod found in either location, Scarab reads its `mod.json` load order and scans mod paks through the same catalog-generation path and in the same merge order.
 
 Specific enabled mods may be subtracted with:
 
@@ -266,7 +291,7 @@ Specific enabled mods may be subtracted with:
 --exclude-mod <folder>
 ```
 
-This option does not create a separate caller-defined mod list. It only excludes matching folders from the set already enabled by MW5.
+This option does not create a separate caller-defined mod list. It only excludes matching folder identifiers from the set already enabled by MW5. For a Steam Workshop mod, the folder identifier is normally its numeric Workshop item ID.
 
 Use:
 
@@ -379,6 +404,7 @@ When reporting a catalog-generation problem, include:
 
 - Scarab version
 - MW5 installation source, if relevant
+- whether an involved mod is installed manually or through Steam Workshop
 - the command or options used
 - a clear description of the unexpected result
 - relevant console output

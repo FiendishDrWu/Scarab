@@ -17,7 +17,7 @@ body:
     attributes:
       label: Scarab version
       description: Which Scarab version are you using?
-      placeholder: "Example: 1.7.3"
+      placeholder: "Example: 1.7.6"
     validations:
       required: true
 
@@ -46,14 +46,29 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: mod-installation-source
+    attributes:
+      label: Mod installation source
+      description: If mods are involved, how are the affected mods installed?
+      options:
+        - Not applicable
+        - Manual or Nexus installation under MW5Mercs/Mods
+        - Steam Workshop
+        - Both manual and Steam Workshop mods
+        - Other or unknown
+    validations:
+      required: true
+
   - type: textarea
     id: mod-details
     attributes:
       label: Relevant mod details
       description: |
         If mods are involved, identify the mod or mods and any relevant load-order information.
+        For Steam Workshop mods, include the numeric Workshop item ID when available.
         Do not upload mod files unless you have permission to redistribute them.
-      placeholder: "Mod name, version, source page, load-order details, or other relevant information."
+      placeholder: "Mod name, version, folder or Workshop item ID, source page, load-order details, or other relevant information."
 
   - type: textarea
     id: command

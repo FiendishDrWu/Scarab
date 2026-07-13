@@ -6,9 +6,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        Scarab is intentionally focused on generating asset catalogs for JJ's MechWarrior 5: Mercenaries Save Editor.
+        Scarab is focused on generating structured MechWarrior 5 asset catalogs for save editors, mod-development tools, and related MW5 tooling. JJ's MechWarrior 5: Mercenaries Save Editor remains Scarab's primary integration.
 
-        It is not intended to become a general pak explorer, asset browser, or standalone save editor.
+        Scarab is not intended to become a general pak explorer, asset browser, or standalone save editor.
 
   - type: textarea
     id: problem
@@ -29,11 +29,11 @@ body:
       required: true
 
   - type: textarea
-    id: jj-editor-value
+    id: integration-value
     attributes:
-      label: How would this help JJ's editor or Scarab catalog generation?
-      description: Explain how the request improves Scarab's catalog output, MW5 asset discovery, or integration with JJ's editor.
-      placeholder: "Describe the practical catalog or editor integration benefit."
+      label: How would this improve Scarab or its integrations?
+      description: Explain how the request improves Scarab's catalog output, MW5 asset discovery, or integration with save editors and other tools.
+      placeholder: "Describe the practical catalog or integration benefit."
     validations:
       required: true
 
@@ -58,7 +58,7 @@ body:
       options:
         - label: I searched existing issues for the same or a substantially similar request.
           required: true
-        - label: I understand Scarab is focused on asset catalog generation for JJ's editor and is not intended to become a general pak explorer, asset browser, or standalone save editor.
+        - label: I understand Scarab is focused on MW5 asset catalog generation and is not intended to become a general pak explorer, asset browser, or standalone save editor.
           required: true
         - label: I have not attached copyrighted MW5 game assets or third-party mod files that I do not have permission to redistribute.
           required: true
