@@ -1,0 +1,108 @@
+# -----------------------------------------------------------------------------
+# Rust / Cargo
+# -----------------------------------------------------------------------------
+
+/target/
+/target-*/
+
+# Rust compiler backup files
+**/*.rs.bk
+
+
+# -----------------------------------------------------------------------------
+# Local Cargo and tool caches
+# -----------------------------------------------------------------------------
+
+/.cargo-home/
+/.rustup/
+/references/
+
+
+# -----------------------------------------------------------------------------
+# IDEs and editors
+# -----------------------------------------------------------------------------
+
+/.vscode/
+/.idea/
+/.vs/
+/.cursor/
+/.codex/
+
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+*.swp
+*.swo
+*~
+
+
+# -----------------------------------------------------------------------------
+# Operating system metadata
+# -----------------------------------------------------------------------------
+
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+
+# -----------------------------------------------------------------------------
+# Local environment and secrets
+# -----------------------------------------------------------------------------
+
+.env
+.env.*
+!.env.example
+
+
+# -----------------------------------------------------------------------------
+# Temporary and diagnostic files
+# -----------------------------------------------------------------------------
+
+*.log
+*.tmp
+*.temp
+*.bak
+
+
+# -----------------------------------------------------------------------------
+# Local development handoff notes
+# -----------------------------------------------------------------------------
+
+/HANDOFF_*.md
+
+
+# -----------------------------------------------------------------------------
+# Scarab-generated catalog output
+# -----------------------------------------------------------------------------
+
+# Local smoke-test and development output directories
+/api-python-catalog/
+/api-json-catalog/
+/jj-catalog/
+/catalogs/
+/base-json/
+/no-base/
+/filtered/
+
+# Accidental root-level catalog output
+/item_catalog.py
+/item_catalog.json
+/item_catalog.json.gz
+/mech_catalog.py
+/mech_catalog.json
+/mech_catalog.json.gz
+/trait_catalog.py
+/trait_catalog.json
+/trait_catalog.json.gz
+/stock_templates.json.gz
+/catalog_build_report.json
+
+
+# -----------------------------------------------------------------------------
+# Local release staging
+# -----------------------------------------------------------------------------
+
+/dist/
+/artifacts/

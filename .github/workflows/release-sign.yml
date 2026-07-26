@@ -1,0 +1,2194 @@
+name: Public release signing and publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Exact release version without a leading v (for example, 1.7.7)
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character public source commit SHA to build and tag
+        required: true
+        type: string
+
+concurrency:
+  group: scarab-signed-release-publication
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_VERSION: ${{ inputs.release_version }}
+  RELEASE_BRANCH: ${{ format('v{0}', inputs.release_version) }}
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  UNSIGNED_ARTIFACT_NAME: ${{ format('scarab-unsigned-{0}-{1}', github.run_id, github.run_attempt) }}
+  SIGNED_ARTIFACT_NAME: ${{ format('scarab-signed-{0}-{1}', github.run_id, github.run_attempt) }}
+  RUNTIME_ARTIFACT_NAME: ${{ format('scarab-runtime-verified-{0}-{1}', github.run_id, github.run_attempt) }}
+  RELEASE_ARTIFACT_NAME: ${{ format('Scarab-v{0}-windows-x64-{1}-{2}', inputs.release_version, github.run_id, github.run_attempt) }}
+
+jobs:
+  build:
+    name: Validate and build exact public source
+    runs-on: windows-2025
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out exact public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+
+      - name: Validate release request and source root
+        shell: pwsh
+        run: |
+          function Invoke-NativeCommand($Description, [scriptblock]$Command) {
+            $output = & $Command
+            if ($LASTEXITCODE -ne 0) {
+              throw "$Description failed with exit code $LASTEXITCODE."
+            }
+            return @($output)
+          }
+
+          if ($env:GITHUB_EVENT_NAME -ne "workflow_dispatch") {
+            throw "Public release signing must be triggered by workflow_dispatch."
+          }
+          if ($env:GITHUB_REPOSITORY -cne "FiendishDrWu/Scarab") {
+            throw "This workflow may run only in FiendishDrWu/Scarab, not '$env:GITHUB_REPOSITORY'."
+          }
+          if ($env:GITHUB_REF_TYPE -ne "branch" -or $env:GITHUB_REF_NAME -cne "main" -or $env:GITHUB_REF -cne "refs/heads/main") {
+            throw "The public release workflow must be dispatched from refs/heads/main."
+          }
+          if ($env:RELEASE_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "release_version '$env:RELEASE_VERSION' must be an exact MAJOR.MINOR.PATCH version without a leading v, prerelease, build metadata, or leading zeroes."
+          }
+          if ($env:RELEASE_BRANCH -cne "v$env:RELEASE_VERSION") {
+            throw "Derived release tag '$env:RELEASE_BRANCH' did not match v$env:RELEASE_VERSION."
+          }
+          if ($env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$') {
+            throw "source_sha must be exactly 40 lowercase hexadecimal characters."
+          }
+
+          if ($env:GITHUB_SHA -cne $env:SOURCE_SHA) {
+            throw "workflow_dispatch resolved main to $env:GITHUB_SHA, not requested source_sha $env:SOURCE_SHA."
+          }
+          $headCommitOutput = @(Invoke-NativeCommand "git rev-parse HEAD" { git rev-parse HEAD })
+          if ($headCommitOutput.Count -ne 1) {
+            throw "git rev-parse HEAD returned $($headCommitOutput.Count) lines; expected exactly one."
+          }
+          $headCommit = ([string]$headCommitOutput[0]).Trim()
+          if ($headCommit -cne $env:SOURCE_SHA) {
+            throw "Checked-out HEAD $headCommit did not match source_sha $env:SOURCE_SHA."
+          }
+
+          $mainRefs = @(Invoke-NativeCommand "git ls-remote origin refs/heads/main" { git ls-remote --refs origin refs/heads/main })
+          if ($mainRefs.Count -ne 1 -or $mainRefs[0] -cnotmatch '^([0-9a-f]{40})\s+refs/heads/main$') {
+            throw "Could not resolve exactly one public refs/heads/main commit."
+          }
+          if ($Matches[1] -cne $env:SOURCE_SHA) {
+            throw "Public main moved to $($Matches[1]) before the build began; expected $env:SOURCE_SHA."
+          }
+
+          $commitObject = @(Invoke-NativeCommand "git cat-file -p source_sha" { git cat-file -p $env:SOURCE_SHA })
+          $parentLines = @($commitObject | Where-Object { $_ -match '^parent [0-9a-f]{40}$' })
+          if ($parentLines.Count -ne 0) {
+            throw "Public source commit $env:SOURCE_SHA must be a parentless root commit, but found $($parentLines.Count) parent(s)."
+          }
+
+          $cargoToml = Get-Content -Path "Cargo.toml"
+          $inPackage = $false
+          $cargoVersion = $null
+
+          foreach ($line in $cargoToml) {
+            if ($line -match '^\s*\[package\]\s*$') {
+              $inPackage = $true
+              continue
+            }
+            if ($inPackage -and $line -match '^\s*\[') {
+              break
+            }
+            if ($inPackage -and $line -match '^\s*version\s*=\s*"([^"]+)"\s*$') {
+              $cargoVersion = $Matches[1]
+              break
+            }
+          }
+
+          if (-not $cargoVersion) {
+            throw "Could not read package.version from Cargo.toml."
+          }
+          if ($cargoVersion -ne $env:RELEASE_VERSION) {
+            throw "Requested release version $env:RELEASE_VERSION does not match Cargo package.version $cargoVersion."
+          }
+          Write-Host "Validated public root commit $env:SOURCE_SHA for Scarab $env:RELEASE_VERSION."
+
+      - name: Preflight public release target
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          function Get-GitHubNextLink($Headers) {
+            if ($null -eq $Headers -or -not $Headers.ContainsKey("Link")) {
+              return $null
+            }
+
+            $linkHeader = ($Headers["Link"] -join ",")
+            foreach ($part in ($linkHeader -split ",")) {
+              if ($part -match '<([^>]+)>;\s*rel="next"') {
+                return $Matches[1]
+              }
+            }
+            return $null
+          }
+
+          function Invoke-GitHubGet($Uri, [switch]$AllowNotFound) {
+            try {
+              $response = Invoke-WebRequest `
+                -Method Get `
+                -Uri $Uri `
+                -Headers $headers `
+                -MaximumRetryCount 3 `
+                -RetryIntervalSec 10
+            } catch {
+              $statusCode = if ($null -ne $_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { "unknown" }
+              if ($AllowNotFound -and $statusCode -eq 404) {
+                return $null
+              }
+              throw "GitHub GET request failed for $Uri with HTTP status $statusCode."
+            }
+
+            if ([string]::IsNullOrWhiteSpace($response.Content)) {
+              return $null
+            }
+            return $response.Content | ConvertFrom-Json
+          }
+
+          function Get-PublicReleaseClassification([string]$TagName, [string]$ExpectedTitle, [string]$WorkflowMarker) {
+            $publishedMatches = @()
+            $workflowDrafts = @()
+            $conflictingDrafts = @()
+            $uri = "https://api.github.com/repos/$owner/$repo/releases?per_page=100"
+
+            while ($uri) {
+              try {
+                $response = Invoke-WebRequest `
+                  -Method Get `
+                  -Uri $uri `
+                  -Headers $headers `
+                  -MaximumRetryCount 3 `
+                  -RetryIntervalSec 10
+              } catch {
+                $statusCode = if ($null -ne $_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { "unknown" }
+                throw "GitHub release listing failed with HTTP status $statusCode."
+              }
+
+              $releases = $response.Content | ConvertFrom-Json
+              foreach ($release in @($releases)) {
+                $releaseBody = $release.body -as [string]
+
+                if ($release.draft -ne $true -and $release.tag_name -eq $TagName) {
+                  $publishedMatches += $release
+                  continue
+                }
+
+                if ($release.draft -eq $true -and $release.name -eq $ExpectedTitle) {
+                  if ($releaseBody -notlike "*$WorkflowMarker*") {
+                    $conflictingDrafts += $release
+                    continue
+                  }
+                  if ($release.prerelease -ne $false) {
+                    $conflictingDrafts += $release
+                    continue
+                  }
+                  $workflowDrafts += $release
+                }
+              }
+              $uri = Get-GitHubNextLink $response.Headers
+            }
+
+            return [pscustomobject]@{
+              PublishedMatches = @($publishedMatches)
+              WorkflowDrafts = @($workflowDrafts)
+              ConflictingDrafts = @($conflictingDrafts)
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+            throw "The workflow GITHUB_TOKEN is required for public release preflight."
+          }
+          if ($env:RELEASE_BRANCH -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "RELEASE_BRANCH must match vMAJOR.MINOR.PATCH before public release preflight."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
+            throw "RELEASE_VERSION is required before public release preflight."
+          }
+
+          $owner = "FiendishDrWu"
+          $repo = "Scarab"
+          $targetFullName = "$owner/$repo"
+          $workflowMarker = "<!-- scarab-release-publisher:v2 -->"
+          $releaseTitle = "Scarab $env:RELEASE_BRANCH"
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "Authorization" = "Bearer $env:GITHUB_TOKEN"
+            "X-GitHub-Api-Version" = "2026-03-10"
+            "User-Agent" = "Scarab-Release-Publisher"
+          }
+
+          $repository = Invoke-GitHubGet "https://api.github.com/repos/$owner/$repo"
+          if ($repository.full_name -ne $targetFullName) {
+            throw "Public release repository full_name was '$($repository.full_name)', expected '$targetFullName'."
+          }
+          if ($repository.private -ne $false) {
+            throw "Public release repository '$targetFullName' must be public."
+          }
+          if ([string]::IsNullOrWhiteSpace($repository.default_branch)) {
+            throw "Public release repository '$targetFullName' did not report a default branch."
+          }
+
+          $classification = Get-PublicReleaseClassification $env:RELEASE_BRANCH $releaseTitle $workflowMarker
+          if ($classification.PublishedMatches.Count -gt 1) {
+            throw "Multiple published public releases already use tag '$env:RELEASE_BRANCH'; manual review is required."
+          }
+          if ($classification.PublishedMatches.Count -eq 1) {
+            throw "Public release $env:RELEASE_BRANCH is already published. Refusing to rebuild or consume another signing operation for an immutable released version."
+          }
+           if ($classification.ConflictingDrafts.Count -gt 0) {
+             $conflictingIds = ($classification.ConflictingDrafts | ForEach-Object { $_.id }) -join ", "
+             throw "Found conflicting draft public release(s) for '$releaseTitle' requiring manual review: $conflictingIds."
+           }
+           foreach ($draft in @($classification.WorkflowDrafts)) {
+             if (($draft.body -as [string]) -notlike "*- Source commit: $env:SOURCE_SHA*") {
+               throw "Workflow-owned draft release $($draft.id) is not bound to public source commit $env:SOURCE_SHA; manual review is required before signing."
+             }
+           }
+           Write-Host "Found $($classification.WorkflowDrafts.Count) resumable workflow-owned public draft release(s) for $env:RELEASE_BRANCH."
+
+          $tagRef = Invoke-GitHubGet "https://api.github.com/repos/$owner/$repo/git/ref/tags/$($env:RELEASE_BRANCH)" -AllowNotFound
+          if ($null -ne $tagRef) {
+            throw "Public tag '$env:RELEASE_BRANCH' already exists without a matching workflow-owned draft release; refusing to reuse or overwrite it."
+          }
+
+          Write-Host "Public release target preflight passed for $targetFullName $env:RELEASE_BRANCH."
+
+      - name: Install stable Rust toolchain
+        shell: pwsh
+        run: |
+          function Invoke-NativeCommand($Description, [scriptblock]$Command) {
+            & $Command
+            if ($LASTEXITCODE -ne 0) {
+              throw "$Description failed with exit code $LASTEXITCODE."
+            }
+          }
+
+          Invoke-NativeCommand "rustup toolchain install stable --profile minimal --component rustfmt,clippy" { rustup toolchain install stable --profile minimal --component rustfmt,clippy }
+          Invoke-NativeCommand "rustup default stable" { rustup default stable }
+          Invoke-NativeCommand "rustc --version" { rustc --version }
+          Invoke-NativeCommand "cargo --version" { cargo --version }
+
+      - name: Run Rust validation suite
+        shell: pwsh
+        run: |
+          function Invoke-NativeCommand($Description, [scriptblock]$Command) {
+            & $Command
+            if ($LASTEXITCODE -ne 0) {
+              throw "$Description failed with exit code $LASTEXITCODE."
+            }
+          }
+
+          Invoke-NativeCommand "cargo fmt --check" { cargo fmt --check }
+          Invoke-NativeCommand "cargo check --locked" { cargo check --locked }
+          Invoke-NativeCommand "cargo test --locked" { cargo test --locked }
+          Invoke-NativeCommand "cargo clippy --locked --all-targets --all-features -- -D warnings" { cargo clippy --locked --all-targets --all-features -- -D warnings }
+
+      - name: Build release executable
+        shell: pwsh
+        run: |
+          cargo build --locked --release
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo build --locked --release failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Validate unsigned executable identity
+        shell: pwsh
+        run: |
+          function Assert-ExactValue($Name, $Actual, $Expected) {
+            if ($Actual -ne $Expected) {
+              throw "$Name was '$Actual', expected '$Expected'."
+            }
+          }
+
+          function Assert-VersionValue($Name, $Actual, $Expected) {
+            $allowed = @($Expected, "$Expected.0")
+            if ($allowed -notcontains $Actual) {
+              throw "$Name was '$Actual', expected '$Expected' or '$Expected.0'."
+            }
+          }
+
+          $exe = Join-Path $env:GITHUB_WORKSPACE "target\release\scarab.exe"
+          if (-not (Test-Path -Path $exe -PathType Leaf)) {
+            throw "Release executable not found at $exe."
+          }
+
+          $versionOutput = & $exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "scarab.exe --version failed before signing."
+          }
+          $actualVersionOutput = ($versionOutput -join "`n").Trim()
+          $expectedVersionOutput = "scarab $env:RELEASE_VERSION"
+          if ($actualVersionOutput -ne $expectedVersionOutput) {
+            throw "scarab.exe --version was '$actualVersionOutput' before signing, expected '$expectedVersionOutput'."
+          }
+
+          $info = (Get-Item -Path $exe).VersionInfo
+          Assert-ExactValue "CompanyName" $info.CompanyName "Kung Fu Island"
+          Assert-ExactValue "ProductName" $info.ProductName "Scarab"
+          Assert-ExactValue "FileDescription" $info.FileDescription "MW5 Mercenaries Asset Catalog Generator"
+          Assert-ExactValue "InternalName" $info.InternalName "scarab"
+          Assert-ExactValue "OriginalFilename" $info.OriginalFilename "scarab.exe"
+          Assert-ExactValue "LegalCopyright" $info.LegalCopyright "Copyright $([char]0x00A9) 2026 FiendishDrWu"
+          Assert-VersionValue "FileVersion" $info.FileVersion $env:RELEASE_VERSION
+          Assert-VersionValue "ProductVersion" $info.ProductVersion $env:RELEASE_VERSION
+          Write-Host "Unsigned executable identity validated."
+
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          if (Test-Path -Path $dist) {
+            Remove-Item -Path $dist -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $dist | Out-Null
+
+          $source = Join-Path $env:GITHUB_WORKSPACE "target\release\scarab.exe"
+          $staged = Join-Path $dist "scarab.exe"
+          Copy-Item -Path $source -Destination $staged
+
+          $dependencyNoticePath = Join-Path $env:GITHUB_WORKSPACE "THIRD_PARTY_LICENSES.txt"
+          if (-not (Test-Path -LiteralPath $dependencyNoticePath -PathType Leaf)) {
+            throw "The public source is missing THIRD_PARTY_LICENSES.txt."
+          }
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          $dependencyNotice = [IO.File]::ReadAllText($dependencyNoticePath, $strictUtf8)
+          if ([string]::IsNullOrWhiteSpace($dependencyNotice) -or
+              $dependencyNotice -notlike "*THIRD-PARTY LICENSE NOTICES FOR SCARAB*" -or
+              $dependencyNotice -notlike "*Copyright (c) 2026 JJ (jonayetjubaer-cmyk)*" -or
+              $dependencyNotice -notlike "*Unicode-3.0*" -or
+              $dependencyNotice -notlike "*Zstandard*") {
+            throw "THIRD_PARTY_LICENSES.txt did not contain the required dependency notice markers."
+          }
+
+          $sysrootOutput = & rustc --print sysroot
+          if ($LASTEXITCODE -ne 0) {
+            throw "rustc --print sysroot failed with exit code $LASTEXITCODE."
+          }
+          $sysroot = ($sysrootOutput -join "`n").Trim()
+          if ([string]::IsNullOrWhiteSpace($sysroot)) {
+            throw "rustc --print sysroot returned an empty path."
+          }
+          $rustNoticePath = Join-Path $sysroot "share\doc\rust\COPYRIGHT-library.html"
+          if (-not (Test-Path -LiteralPath $rustNoticePath -PathType Leaf)) {
+            throw "The installed Rust toolchain did not provide COPYRIGHT-library.html at '$rustNoticePath'."
+          }
+          $rustNotice = [IO.File]::ReadAllText($rustNoticePath, $strictUtf8)
+          $rustBodyMatches = [regex]::Matches(
+            $rustNotice,
+            '<body(?:\s[^>]*)?>',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+          )
+          $rustBodyClosingMatches = [regex]::Matches(
+            $rustNotice,
+            '</body\s*>',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+          )
+          if ($rustBodyMatches.Count -ne 1 -or
+              $rustBodyClosingMatches.Count -ne 1 -or
+              $rustNotice -notlike "*Copyright notices for The Rust Standard Library*") {
+            throw "The installed Rust COPYRIGHT-library.html did not have the expected structure."
+          }
+
+          $rustVersionOutput = & rustc --version --verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "rustc --version --verbose failed with exit code $LASTEXITCODE."
+          }
+          $rustVersion = ($rustVersionOutput -join "`n").Trim()
+          if ($rustVersion -notmatch '^rustc [0-9]+\.[0-9]+\.[0-9]+') {
+            throw "rustc --version --verbose did not report a stable semantic version."
+          }
+
+          $encodedDependencyNotice = [Net.WebUtility]::HtmlEncode($dependencyNotice)
+          $encodedRustVersion = [Net.WebUtility]::HtmlEncode($rustVersion)
+          if (-not [string]::Equals(
+            [Net.WebUtility]::HtmlDecode($encodedDependencyNotice),
+            $dependencyNotice,
+            [StringComparison]::Ordinal
+          )) {
+            throw "HTML encoding did not preserve THIRD_PARTY_LICENSES.txt exactly."
+          }
+          $dependencyNoticeSha256 = (Get-FileHash -LiteralPath $dependencyNoticePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $rustNoticeSha256 = (Get-FileHash -LiteralPath $rustNoticePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $insertion = @"
+
+          <section id="scarab-third-party-licenses" style="margin:2rem auto;max-width:72rem;padding:0 1rem">
+            <h1>Third-party licenses for Scarab $env:RELEASE_BRANCH</h1>
+            <p>Release source commit: <code>$env:SOURCE_SHA</code></p>
+            <p>This file combines Scarab's locked dependency and incorporated-source notices with the consolidated standard-library notice supplied by the exact Rust toolchain used for this executable.</p>
+            <p>Scarab notice source SHA-256: <code>$dependencyNoticeSha256</code><br>
+            Rust standard-library notice source SHA-256: <code>$rustNoticeSha256</code></p>
+            <h2>Build toolchain</h2>
+            <pre style="border:1px solid #bbb;overflow-x:auto;padding:1rem;white-space:pre-wrap">$encodedRustVersion</pre>
+            <h2>Scarab dependency and incorporated-source notices</h2>
+            <pre style="border:1px solid #bbb;overflow-x:auto;padding:1rem;white-space:pre-wrap">$encodedDependencyNotice</pre>
+          </section>
+
+          "@
+          $insertionOffset = $rustBodyMatches[0].Index + $rustBodyMatches[0].Length
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+          $licenseBundle = $rustNotice.Insert($insertionOffset, $insertion)
+          if (-not [string]::Equals(
+            $licenseBundle.Remove($insertionOffset, $insertion.Length),
+            $rustNotice,
+            [StringComparison]::Ordinal
+          )) {
+            throw "Generated license bundle did not preserve the Rust standard-library notice exactly."
+          }
+          [IO.File]::WriteAllText(
+            $licenseBundlePath,
+            $licenseBundle,
+            [Text.UTF8Encoding]::new($false)
+          )
+
+          $licenseBundleText = [IO.File]::ReadAllText($licenseBundlePath, $strictUtf8)
+          if (-not [string]::Equals($licenseBundleText, $licenseBundle, [StringComparison]::Ordinal)) {
+            throw "Generated THIRD_PARTY_LICENSES.html did not round-trip through strict UTF-8."
+          }
+          if ($licenseBundleText -notlike "*THIRD-PARTY LICENSE NOTICES FOR SCARAB*" -or
+              $licenseBundleText -notlike "*Copyright notices for The Rust Standard Library*" -or
+              $licenseBundleText -notlike "*$env:SOURCE_SHA*") {
+            throw "Generated THIRD_PARTY_LICENSES.html did not contain the required provenance and notice sections."
+          }
+
+          $files = @(Get-ChildItem -Path $dist -File)
+          $expectedFileNames = @("scarab.exe", "THIRD_PARTY_LICENSES.html")
+          if ($files.Count -ne 2) {
+            throw "Release staging directory must contain exactly two files."
+          }
+          foreach ($file in $files) {
+            if ($expectedFileNames -notcontains $file.Name) {
+              throw "Release staging directory contains unexpected file '$($file.Name)'."
+            }
+          }
+          "STAGED_EXE=$staged" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Staged $staged and $licenseBundlePath."
+
+      - name: Create unsigned artifact manifest
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $exe = Join-Path $dist "scarab.exe"
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+          $manifestPath = Join-Path $dist "unsigned-artifact.json"
+          $unsignedSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $licenseBundleSha256 = (Get-FileHash -Path $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            schema_version = 2
+            artifact_type = "unsigned"
+            release_version = $env:RELEASE_VERSION
+            release_tag = $env:RELEASE_BRANCH
+            source_sha = $env:SOURCE_SHA
+            executable_sha256 = $unsignedSha256
+            executable_size = (Get-Item -Path $exe).Length
+            third_party_licenses_sha256 = $licenseBundleSha256
+            third_party_licenses_size = (Get-Item -Path $licenseBundlePath).Length
+          }
+          $manifest | ConvertTo-Json -Depth 3 | Set-Content -Path $manifestPath -Encoding utf8
+
+          $files = @(Get-ChildItem -Path $dist -File)
+          if ($files.Count -ne 3 -or
+              $files.Name -notcontains "scarab.exe" -or
+              $files.Name -notcontains "THIRD_PARTY_LICENSES.html" -or
+              $files.Name -notcontains "unsigned-artifact.json") {
+            throw "Unsigned handoff must contain exactly scarab.exe, THIRD_PARTY_LICENSES.html, and unsigned-artifact.json."
+          }
+          Write-Host "Unsigned executable SHA-256: $unsignedSha256"
+          Write-Host "Third-party license bundle SHA-256: $licenseBundleSha256"
+
+      - name: Upload unsigned build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.UNSIGNED_ARTIFACT_NAME }}
+          path: |
+            dist/scarab.exe
+            dist/THIRD_PARTY_LICENSES.html
+            dist/unsigned-artifact.json
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign without executing the binary
+    needs: build
+    runs-on: windows-2025
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download unsigned build artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.UNSIGNED_ARTIFACT_NAME }}
+          path: dist
+
+      - name: Validate unsigned artifact hash and provenance
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $expectedFileNames = @("scarab.exe", "THIRD_PARTY_LICENSES.html", "unsigned-artifact.json")
+          $files = @(Get-ChildItem -Path $dist -File)
+          if ($files.Count -ne 3) {
+            throw "Unsigned artifact must contain exactly three files."
+          }
+          foreach ($file in $files) {
+            if ($expectedFileNames -notcontains $file.Name) {
+              throw "Unsigned artifact contains unexpected file '$($file.Name)'."
+            }
+          }
+
+          $exe = Join-Path $dist "scarab.exe"
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+          $manifestPath = Join-Path $dist "unsigned-artifact.json"
+          $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.schema_version -ne 2 -or $manifest.artifact_type -ne "unsigned") {
+            throw "Unsigned artifact manifest identity was invalid."
+          }
+          if ($manifest.release_version -cne $env:RELEASE_VERSION -or
+              $manifest.release_tag -cne $env:RELEASE_BRANCH -or
+              $manifest.source_sha -cne $env:SOURCE_SHA) {
+            throw "Unsigned artifact manifest release provenance did not match the dispatch request."
+          }
+          if ($manifest.executable_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              $manifest.third_party_licenses_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "Unsigned artifact manifest hashes were invalid."
+          }
+          $actualSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $manifest.executable_sha256) {
+            throw "Unsigned executable SHA-256 $actualSha256 did not match its manifest."
+          }
+          if ([int64](Get-Item -Path $exe).Length -ne [int64]$manifest.executable_size) {
+            throw "Unsigned executable size did not match its manifest."
+          }
+          $actualLicenseBundleSha256 = (Get-FileHash -Path $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualLicenseBundleSha256 -cne $manifest.third_party_licenses_sha256) {
+            throw "Third-party license bundle SHA-256 $actualLicenseBundleSha256 did not match its unsigned manifest."
+          }
+          if ([int64](Get-Item -Path $licenseBundlePath).Length -ne [int64]$manifest.third_party_licenses_size) {
+            throw "Third-party license bundle size did not match its unsigned manifest."
+          }
+          "UNSIGNED_SHA256=$actualSha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "THIRD_PARTY_LICENSES_SHA256=$actualLicenseBundleSha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Validated unsigned artifact for source $env:SOURCE_SHA without executing it."
+
+      - name: Azure login
+        uses: Azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign staged executable
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\scarab.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          append-signature: false
+
+      - name: Verify Authenticode signature
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist\scarab.exe"
+          $signature = Get-AuthenticodeSignature -FilePath $exe
+
+          if ($signature.Status -ne "Valid") {
+            throw "Authenticode signature status was '$($signature.Status)': $($signature.StatusMessage)"
+          }
+          if ($null -eq $signature.SignerCertificate) {
+            throw "Authenticode signature is missing a signer certificate."
+          }
+          if ($null -eq $signature.TimeStamperCertificate) {
+            throw "Authenticode signature is missing a timestamp certificate."
+          }
+
+          Write-Host "Signature status: $($signature.Status)"
+          Write-Host "Signer subject: $($signature.SignerCertificate.Subject)"
+          Write-Host "Signer certificate expiration: $($signature.SignerCertificate.NotAfter.ToString('o'))"
+          Write-Host "Timestamp authority subject: $($signature.TimeStamperCertificate.Subject)"
+          Write-Host "Timestamp certificate expiration: $($signature.TimeStamperCertificate.NotAfter.ToString('o'))"
+
+      - name: Verify signature with SignTool
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+          if (-not (Test-Path -Path $sdkRoot -PathType Container)) {
+            throw "Windows SDK bin folder not found at $sdkRoot."
+          }
+
+          $signtoolCandidates = Get-ChildItem -Path $sdkRoot -Recurse -Filter "signtool.exe" |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' }
+
+          $versionedCandidates = foreach ($candidate in $signtoolCandidates) {
+            $sdkVersionText = $candidate.Directory.Parent.Name
+            $sdkVersion = $null
+            if ([version]::TryParse($sdkVersionText, [ref]$sdkVersion)) {
+              [pscustomobject]@{
+                Version = $sdkVersion
+                File = $candidate
+              }
+            }
+          }
+
+          $signtool = $versionedCandidates |
+            Sort-Object -Property Version -Descending |
+            Select-Object -First 1 |
+            ForEach-Object { $_.File }
+
+          if ($null -eq $signtool) {
+            throw "Could not locate a versioned x64 signtool.exe in the installed Windows SDK."
+          }
+
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist\scarab.exe"
+          Write-Host "Using SignTool: $($signtool.FullName)"
+          & $signtool.FullName verify /pa /all /v $exe
+          if ($LASTEXITCODE -ne 0) {
+            throw "SignTool verification failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Create signed artifact manifest
+        shell: pwsh
+        run: |
+          if ($env:UNSIGNED_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "UNSIGNED_SHA256 was not available from the validated unsigned artifact."
+          }
+          if ($env:THIRD_PARTY_LICENSES_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "THIRD_PARTY_LICENSES_SHA256 was not available from the validated unsigned artifact."
+          }
+
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $exe = Join-Path $dist "scarab.exe"
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+          $manifestPath = Join-Path $dist "signed-artifact.json"
+          $signedSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($signedSha256 -ceq $env:UNSIGNED_SHA256) {
+            throw "Artifact Signing did not change the executable SHA-256."
+          }
+
+          $signature = Get-AuthenticodeSignature -FilePath $exe
+          if ($signature.Status -ne "Valid" -or
+              $null -eq $signature.SignerCertificate -or
+              $null -eq $signature.TimeStamperCertificate) {
+            throw "Cannot create signed manifest without a valid signer and timestamp certificate."
+          }
+          $licenseBundleSha256 = (Get-FileHash -Path $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($licenseBundleSha256 -cne $env:THIRD_PARTY_LICENSES_SHA256) {
+            throw "Third-party license bundle changed during signing."
+          }
+
+          $manifest = [ordered]@{
+            schema_version = 2
+            artifact_type = "signed"
+            release_version = $env:RELEASE_VERSION
+            release_tag = $env:RELEASE_BRANCH
+            source_sha = $env:SOURCE_SHA
+            unsigned_sha256 = $env:UNSIGNED_SHA256
+            signed_sha256 = $signedSha256
+            executable_size = (Get-Item -Path $exe).Length
+            third_party_licenses_sha256 = $licenseBundleSha256
+            third_party_licenses_size = (Get-Item -Path $licenseBundlePath).Length
+            signer_thumbprint = $signature.SignerCertificate.Thumbprint.ToLowerInvariant()
+            timestamper_thumbprint = $signature.TimeStamperCertificate.Thumbprint.ToLowerInvariant()
+          }
+          $manifest | ConvertTo-Json -Depth 3 | Set-Content -Path $manifestPath -Encoding utf8
+          Write-Host "Signed executable SHA-256: $signedSha256"
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.SIGNED_ARTIFACT_NAME }}
+          path: |
+            dist/scarab.exe
+            dist/THIRD_PARTY_LICENSES.html
+            dist/signed-artifact.json
+          if-no-files-found: error
+          retention-days: 1
+
+  runtime-verify:
+    name: Verify signed runtime behavior
+    needs: sign
+    runs-on: windows-2025
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download signed artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.SIGNED_ARTIFACT_NAME }}
+          path: dist
+
+      - name: Validate signed artifact hash and signature
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $expectedFileNames = @("scarab.exe", "THIRD_PARTY_LICENSES.html", "signed-artifact.json")
+          $files = @(Get-ChildItem -Path $dist -File)
+          if ($files.Count -ne 3) {
+            throw "Signed artifact must contain exactly three files."
+          }
+          foreach ($file in $files) {
+            if ($expectedFileNames -notcontains $file.Name) {
+              throw "Signed artifact contains unexpected file '$($file.Name)'."
+            }
+          }
+
+          $exe = Join-Path $dist "scarab.exe"
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+          $manifestPath = Join-Path $dist "signed-artifact.json"
+          $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.schema_version -ne 2 -or $manifest.artifact_type -ne "signed") {
+            throw "Signed artifact manifest identity was invalid."
+          }
+          if ($manifest.release_version -cne $env:RELEASE_VERSION -or
+              $manifest.release_tag -cne $env:RELEASE_BRANCH -or
+              $manifest.source_sha -cne $env:SOURCE_SHA) {
+            throw "Signed artifact manifest release provenance did not match the dispatch request."
+          }
+          if ($manifest.unsigned_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              $manifest.signed_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              $manifest.third_party_licenses_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "Signed artifact manifest hashes were invalid."
+          }
+          if ($manifest.unsigned_sha256 -ceq $manifest.signed_sha256) {
+            throw "Signed artifact manifest did not distinguish unsigned and signed hashes."
+          }
+
+          $actualSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $manifest.signed_sha256) {
+            throw "Signed executable SHA-256 $actualSha256 did not match its manifest."
+          }
+          if ([int64](Get-Item -Path $exe).Length -ne [int64]$manifest.executable_size) {
+            throw "Signed executable size did not match its manifest."
+          }
+          $actualLicenseBundleSha256 = (Get-FileHash -Path $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualLicenseBundleSha256 -cne $manifest.third_party_licenses_sha256) {
+            throw "Third-party license bundle SHA-256 $actualLicenseBundleSha256 did not match its signed manifest."
+          }
+          if ([int64](Get-Item -Path $licenseBundlePath).Length -ne [int64]$manifest.third_party_licenses_size) {
+            throw "Third-party license bundle size did not match its signed manifest."
+          }
+
+          $signature = Get-AuthenticodeSignature -FilePath $exe
+          if ($signature.Status -ne "Valid" -or
+              $null -eq $signature.SignerCertificate -or
+              $null -eq $signature.TimeStamperCertificate) {
+            throw "Downloaded executable did not retain a valid Authenticode signature and timestamp."
+          }
+          if ($signature.SignerCertificate.Thumbprint.ToLowerInvariant() -cne $manifest.signer_thumbprint -or
+              $signature.TimeStamperCertificate.Thumbprint.ToLowerInvariant() -cne $manifest.timestamper_thumbprint) {
+            throw "Downloaded executable certificate thumbprints did not match its signed manifest."
+          }
+          "SIGNED_SHA256=$actualSha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Validate signed executable identity and commands
+        shell: pwsh
+        run: |
+          function Assert-ExactValue($Name, $Actual, $Expected) {
+            if ($Actual -ne $Expected) {
+              throw "$Name was '$Actual', expected '$Expected'."
+            }
+          }
+
+          function Assert-VersionValue($Name, $Actual, $Expected) {
+            $allowed = @($Expected, "$Expected.0")
+            if ($allowed -notcontains $Actual) {
+              throw "$Name was '$Actual', expected '$Expected' or '$Expected.0'."
+            }
+          }
+
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist\scarab.exe"
+          $info = (Get-Item -Path $exe).VersionInfo
+          Assert-ExactValue "CompanyName" $info.CompanyName "Kung Fu Island"
+          Assert-ExactValue "ProductName" $info.ProductName "Scarab"
+          Assert-ExactValue "FileDescription" $info.FileDescription "MW5 Mercenaries Asset Catalog Generator"
+          Assert-ExactValue "InternalName" $info.InternalName "scarab"
+          Assert-ExactValue "OriginalFilename" $info.OriginalFilename "scarab.exe"
+          Assert-ExactValue "LegalCopyright" $info.LegalCopyright "Copyright $([char]0x00A9) 2026 FiendishDrWu"
+          Assert-VersionValue "FileVersion" $info.FileVersion $env:RELEASE_VERSION
+          Assert-VersionValue "ProductVersion" $info.ProductVersion $env:RELEASE_VERSION
+
+          $versionOutput = & $exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signed scarab.exe --version failed."
+          }
+          $actualVersionOutput = ($versionOutput -join "`n").Trim()
+          $expectedVersionOutput = "scarab $env:RELEASE_VERSION"
+          if ($actualVersionOutput -ne $expectedVersionOutput) {
+            throw "Signed scarab.exe --version was '$actualVersionOutput', expected '$expectedVersionOutput'."
+          }
+
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signed scarab.exe --help failed."
+          }
+          Write-Host "Signed executable identity and command checks passed."
+
+      - name: Create runtime-verified artifact manifest
+        shell: pwsh
+        run: |
+          if ($env:SIGNED_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "SIGNED_SHA256 was not available from signed artifact validation."
+          }
+
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $signedManifestPath = Join-Path $dist "signed-artifact.json"
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+          $runtimeManifestPath = Join-Path $dist "runtime-artifact.json"
+          $signedManifest = Get-Content -Path $signedManifestPath -Raw | ConvertFrom-Json
+          $licenseBundleSha256 = (Get-FileHash -Path $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($licenseBundleSha256 -cne $signedManifest.third_party_licenses_sha256) {
+            throw "Third-party license bundle changed before runtime artifact creation."
+          }
+          $manifest = [ordered]@{
+            schema_version = 2
+            artifact_type = "runtime-verified"
+            release_version = $env:RELEASE_VERSION
+            release_tag = $env:RELEASE_BRANCH
+            source_sha = $env:SOURCE_SHA
+            signed_sha256 = $env:SIGNED_SHA256
+            signed_manifest_sha256 = (Get-FileHash -Path $signedManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            executable_size = (Get-Item -Path (Join-Path $dist "scarab.exe")).Length
+            third_party_licenses_sha256 = $licenseBundleSha256
+            third_party_licenses_size = (Get-Item -Path $licenseBundlePath).Length
+            version_command = "scarab $env:RELEASE_VERSION"
+            help_command_passed = $true
+          }
+          $manifest | ConvertTo-Json -Depth 3 | Set-Content -Path $runtimeManifestPath -Encoding utf8
+
+      - name: Upload runtime-verified artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.RUNTIME_ARTIFACT_NAME }}
+          path: |
+            dist/scarab.exe
+            dist/THIRD_PARTY_LICENSES.html
+            dist/runtime-artifact.json
+          if-no-files-found: error
+          retention-days: 1
+
+  virustotal:
+    name: Scan signed executable with VirusTotal
+    needs: runtime-verify
+    runs-on: windows-2025
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download runtime-verified artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.RUNTIME_ARTIFACT_NAME }}
+          path: dist
+
+      - name: Validate runtime-verified artifact hash and provenance
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $expectedFileNames = @("scarab.exe", "THIRD_PARTY_LICENSES.html", "runtime-artifact.json")
+          $files = @(Get-ChildItem -Path $dist -File)
+          if ($files.Count -ne 3) {
+            throw "Runtime-verified artifact must contain exactly three files."
+          }
+          foreach ($file in $files) {
+            if ($expectedFileNames -notcontains $file.Name) {
+              throw "Runtime-verified artifact contains unexpected file '$($file.Name)'."
+            }
+          }
+
+          $exe = Join-Path $dist "scarab.exe"
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+          $manifest = Get-Content -Path (Join-Path $dist "runtime-artifact.json") -Raw | ConvertFrom-Json
+          if ($manifest.schema_version -ne 2 -or $manifest.artifact_type -ne "runtime-verified") {
+            throw "Runtime-verified artifact manifest identity was invalid."
+          }
+          if ($manifest.release_version -cne $env:RELEASE_VERSION -or
+              $manifest.release_tag -cne $env:RELEASE_BRANCH -or
+              $manifest.source_sha -cne $env:SOURCE_SHA) {
+            throw "Runtime-verified artifact manifest release provenance did not match the dispatch request."
+          }
+          if ($manifest.signed_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              $manifest.signed_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              $manifest.third_party_licenses_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "Runtime-verified artifact manifest hashes were invalid."
+          }
+          if ($manifest.version_command -cne "scarab $env:RELEASE_VERSION" -or $manifest.help_command_passed -ne $true) {
+            throw "Runtime-verified artifact manifest did not record the expected command checks."
+          }
+
+          $actualSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $manifest.signed_sha256) {
+            throw "Runtime-verified executable SHA-256 $actualSha256 did not match its manifest."
+          }
+          if ([int64](Get-Item -Path $exe).Length -ne [int64]$manifest.executable_size) {
+            throw "Runtime-verified executable size did not match its manifest."
+          }
+          $actualLicenseBundleSha256 = (Get-FileHash -Path $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualLicenseBundleSha256 -cne $manifest.third_party_licenses_sha256) {
+            throw "Runtime-verified third-party license bundle did not match its manifest."
+          }
+          $actualLicenseBundleSize = [int64](Get-Item -Path $licenseBundlePath).Length
+          if ($actualLicenseBundleSize -ne [int64]$manifest.third_party_licenses_size) {
+            throw "Runtime-verified third-party license bundle size did not match its manifest."
+          }
+          "SIGNED_SHA256=$actualSha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "THIRD_PARTY_LICENSES_SHA256=$actualLicenseBundleSha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "THIRD_PARTY_LICENSES_SIZE=$actualLicenseBundleSize" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Compute signed executable checksum
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist\scarab.exe"
+          $checksumPath = Join-Path $env:GITHUB_WORKSPACE "dist\scarab.exe.sha256"
+          $hash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  scarab.exe" | Set-Content -Path $checksumPath -Encoding ascii -NoNewline
+          "SIGNED_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          if (-not (Test-Path -Path $checksumPath -PathType Leaf)) {
+            throw "Checksum file was not created."
+          }
+          Write-Host "Final signed scarab.exe SHA-256: $hash"
+
+      - name: Scan signed executable with VirusTotal
+        shell: pwsh
+        env:
+          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          function Assert-VirusTotalObject($Response, [string]$ExpectedType, [string]$ExpectedId, [string]$Description) {
+            if ($null -eq $Response -or $null -eq $Response.data) {
+              throw "$Description response did not contain a data object."
+            }
+            if ($Response.data.type -ne $ExpectedType) {
+              throw "$Description response data.type was '$($Response.data.type)', expected '$ExpectedType'."
+            }
+            if ($ExpectedId -and $Response.data.id -ne $ExpectedId) {
+              throw "$Description response data.id was '$($Response.data.id)', expected '$ExpectedId'."
+            }
+          }
+
+          function Get-StatCount($Stats, [string]$Name) {
+            $property = $Stats.PSObject.Properties[$Name]
+            if ($null -eq $property) {
+              return [int64]0
+            }
+
+            $value = $property.Value
+            if ($null -eq $value -or $value -is [string] -or $value -is [bool]) {
+              throw "VirusTotal stats.$Name must be a non-negative integer."
+            }
+
+            try {
+              $count = [int64]$value
+            } catch {
+              throw "VirusTotal stats.$Name must be a non-negative integer."
+            }
+
+            if ([double]$value -ne [double]$count -or $count -lt 0) {
+              throw "VirusTotal stats.$Name must be a non-negative integer."
+            }
+
+            return $count
+          }
+
+          function Get-UnixTimeSeconds($Value, [string]$Name) {
+            if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool]) {
+              throw "$Name must be a Unix UTC timestamp."
+            }
+
+            try {
+              $seconds = [int64]$Value
+            } catch {
+              throw "$Name must be a Unix UTC timestamp."
+            }
+
+            if ([double]$Value -ne [double]$seconds -or $seconds -lt 0) {
+              throw "$Name must be a Unix UTC timestamp."
+            }
+
+            return $seconds
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:VIRUSTOTAL_API_KEY)) {
+            throw "VIRUSTOTAL_API_KEY repository secret is required for the VirusTotal release scan."
+          }
+          if ($env:SIGNED_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "SIGNED_SHA256 must be a 64-character lowercase hexadecimal SHA-256 digest."
+          }
+          if ($env:THIRD_PARTY_LICENSES_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "THIRD_PARTY_LICENSES_SHA256 must be a 64-character lowercase hexadecimal SHA-256 digest."
+          }
+          $expectedLicenseBundleSize = 0L
+          if (-not [int64]::TryParse($env:THIRD_PARTY_LICENSES_SIZE, [ref]$expectedLicenseBundleSize) -or
+              $expectedLicenseBundleSize -le 0) {
+            throw "THIRD_PARTY_LICENSES_SIZE must be a positive integer."
+          }
+
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist\scarab.exe"
+          if (-not (Test-Path -Path $exe -PathType Leaf)) {
+            throw "Signed executable not found at $exe."
+          }
+          $licenseBundlePath = Join-Path $env:GITHUB_WORKSPACE "dist\THIRD_PARTY_LICENSES.html"
+          if (-not (Test-Path -LiteralPath $licenseBundlePath -PathType Leaf)) {
+            throw "Third-party license bundle not found at $licenseBundlePath."
+          }
+
+          $recomputedSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($recomputedSha256 -cne $env:SIGNED_SHA256) {
+            throw "Recomputed signed executable SHA-256 $recomputedSha256 did not match SIGNED_SHA256 $env:SIGNED_SHA256."
+          }
+          $recomputedLicenseBundleSha256 = (Get-FileHash -LiteralPath $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($recomputedLicenseBundleSha256 -cne $env:THIRD_PARTY_LICENSES_SHA256) {
+            throw "Recomputed third-party license bundle SHA-256 did not match THIRD_PARTY_LICENSES_SHA256."
+          }
+          if ([int64](Get-Item -LiteralPath $licenseBundlePath).Length -ne $expectedLicenseBundleSize) {
+            throw "Recomputed third-party license bundle size did not match THIRD_PARTY_LICENSES_SIZE."
+          }
+
+          $headers = @{
+            "x-apikey" = $env:VIRUSTOTAL_API_KEY
+            "accept" = "application/json"
+          }
+
+          $file = Get-Item -Path $exe
+          if ($file.Length -gt 650MB) {
+            throw "dist/scarab.exe is larger than 650 MB; refusing to submit it to VirusTotal."
+          }
+
+          $uploadUri = "https://www.virustotal.com/api/v3/files"
+          if ($file.Length -gt 32MB) {
+            Write-Host "Signed executable is larger than 32 MB; requesting a VirusTotal large-file upload URL."
+            $uploadUrlResponse = Invoke-RestMethod `
+              -Method Get `
+              -Uri "https://www.virustotal.com/api/v3/files/upload_url" `
+              -Headers $headers `
+              -MaximumRetryCount 3 `
+              -RetryIntervalSec 10
+
+            if ($null -eq $uploadUrlResponse -or [string]::IsNullOrWhiteSpace($uploadUrlResponse.data)) {
+              throw "VirusTotal large-file upload URL response did not contain a data URL."
+            }
+            $uploadUri = $uploadUrlResponse.data
+          }
+
+          Write-Host "Uploading final signed dist/scarab.exe to VirusTotal."
+          $uploadResponse = Invoke-RestMethod `
+            -Method Post `
+            -Uri $uploadUri `
+            -Headers $headers `
+            -Form @{ file = $file }
+
+          Assert-VirusTotalObject $uploadResponse "analysis" "" "VirusTotal upload"
+          if ([string]::IsNullOrWhiteSpace($uploadResponse.data.id)) {
+            throw "VirusTotal upload response did not contain a non-empty analysis ID."
+          }
+          $analysisId = $uploadResponse.data.id
+          Write-Host "VirusTotal analysis ID: $analysisId"
+
+          $completedAnalysis = $null
+          for ($poll = 1; $poll -le 20; $poll++) {
+            $analysisResponse = Invoke-RestMethod `
+              -Method Get `
+              -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" `
+              -Headers $headers `
+              -MaximumRetryCount 3 `
+              -RetryIntervalSec 10
+
+            Assert-VirusTotalObject $analysisResponse "analysis" $analysisId "VirusTotal analysis"
+            $status = $analysisResponse.data.attributes.status
+
+            if ($status -eq "completed") {
+              $completedAnalysis = $analysisResponse
+              break
+            }
+            if ($status -eq "queued" -or $status -eq "in-progress") {
+              Write-Host "VirusTotal analysis status: $status ($poll/20)."
+              if ($poll -lt 20) {
+                Start-Sleep -Seconds 30
+              }
+              continue
+            }
+
+            throw "Unexpected VirusTotal analysis status '$status'."
+          }
+
+          if ($null -eq $completedAnalysis) {
+            throw "VirusTotal analysis did not complete within the bounded 20-poll window."
+          }
+
+          $stats = $completedAnalysis.data.attributes.stats
+          if ($null -eq $stats) {
+            throw "Completed VirusTotal analysis did not contain a stats object."
+          }
+
+          $malicious = Get-StatCount $stats "malicious"
+          $suspicious = Get-StatCount $stats "suspicious"
+          $harmless = Get-StatCount $stats "harmless"
+          $undetected = Get-StatCount $stats "undetected"
+          $timeout = Get-StatCount $stats "timeout"
+          $confirmedTimeout = Get-StatCount $stats "confirmed-timeout"
+          $failure = Get-StatCount $stats "failure"
+          $typeUnsupported = Get-StatCount $stats "type-unsupported"
+
+          Write-Host "VirusTotal analysis completed."
+          Write-Host "Malicious: $malicious"
+          Write-Host "Suspicious: $suspicious"
+          Write-Host "Harmless: $harmless"
+          Write-Host "Undetected: $undetected"
+          Write-Host "Timeout: $timeout"
+          Write-Host "Confirmed timeout: $confirmedTimeout"
+          Write-Host "Failure: $failure"
+          Write-Host "Type unsupported: $typeUnsupported"
+
+          if ($malicious -gt 0 -or $suspicious -gt 0) {
+            throw "VirusTotal analysis reported $malicious malicious and $suspicious suspicious detections. This release requires manual review before publication."
+          }
+
+          $fileResponse = Invoke-RestMethod `
+            -Method Get `
+            -Uri "https://www.virustotal.com/api/v3/files/$($env:SIGNED_SHA256)" `
+            -Headers $headers `
+            -MaximumRetryCount 3 `
+            -RetryIntervalSec 10
+
+          Assert-VirusTotalObject $fileResponse "file" "" "VirusTotal file"
+          if ($fileResponse.data.id.ToLowerInvariant() -ne $env:SIGNED_SHA256) {
+            throw "VirusTotal file object ID '$($fileResponse.data.id)' did not match signed SHA-256 $env:SIGNED_SHA256."
+          }
+          if ($null -ne $fileResponse.data.attributes.sha256 -and $fileResponse.data.attributes.sha256.ToLowerInvariant() -ne $env:SIGNED_SHA256) {
+            throw "VirusTotal file object sha256 '$($fileResponse.data.attributes.sha256)' did not match signed SHA-256 $env:SIGNED_SHA256."
+          }
+
+          $reportUrl = "https://www.virustotal.com/gui/file/$($env:SIGNED_SHA256)/detection"
+          Write-Host "VirusTotal release scan passed: 0 malicious / 0 suspicious."
+          Write-Host "VirusTotal report: $reportUrl"
+
+          $analysisDate = Get-UnixTimeSeconds $completedAnalysis.data.attributes.date "VirusTotal analysis date"
+          $analysisDateUtc = [DateTimeOffset]::FromUnixTimeSeconds($analysisDate).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
+
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE "dist\scarab.exe.virustotal.json"
+          $manifest = [ordered]@{
+            schema_version = 2
+            release_branch = $env:RELEASE_BRANCH
+            release_version = $env:RELEASE_VERSION
+            source_sha = $env:SOURCE_SHA
+            sha256 = $env:SIGNED_SHA256
+            third_party_licenses_sha256 = $env:THIRD_PARTY_LICENSES_SHA256
+            third_party_licenses_size = $expectedLicenseBundleSize
+            analysis_id = $analysisId
+            analysis_status = "completed"
+            analysis_date_utc = $analysisDateUtc
+            report_url = $reportUrl
+            stats = [ordered]@{
+              malicious = $malicious
+              suspicious = $suspicious
+              harmless = $harmless
+              undetected = $undetected
+              timeout = $timeout
+              confirmed_timeout = $confirmedTimeout
+              failure = $failure
+              type_unsupported = $typeUnsupported
+            }
+          }
+
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding utf8
+          if (-not (Test-Path -Path $manifestPath -PathType Leaf)) {
+            throw "VirusTotal manifest was not created."
+          }
+
+          $parsedManifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+          if ($parsedManifest.sha256 -cne $env:SIGNED_SHA256) {
+            throw "VirusTotal manifest sha256 did not match SIGNED_SHA256."
+          }
+          if ($parsedManifest.schema_version -ne 2 -or
+              $parsedManifest.third_party_licenses_sha256 -cne $env:THIRD_PARTY_LICENSES_SHA256 -or
+              [int64]$parsedManifest.third_party_licenses_size -ne $expectedLicenseBundleSize) {
+            throw "VirusTotal manifest did not retain the third-party license bundle provenance."
+          }
+          if ($parsedManifest.analysis_status -ne "completed") {
+            throw "VirusTotal manifest analysis_status was not completed."
+          }
+          if ($parsedManifest.stats.malicious -ne 0) {
+            throw "VirusTotal manifest malicious count was not zero."
+          }
+          if ($parsedManifest.stats.suspicious -ne 0) {
+            throw "VirusTotal manifest suspicious count was not zero."
+          }
+
+          @(
+            "## VirusTotal release scan"
+            ""
+            "Scarab release version: $env:RELEASE_VERSION"
+            ""
+            "Signed SHA-256: ``$env:SIGNED_SHA256``"
+            ""
+            "Result: 0 malicious / 0 suspicious"
+            ""
+            "Harmless: $harmless"
+            ""
+            "Undetected: $undetected"
+            ""
+            "[VirusTotal report]($reportUrl)"
+            ""
+          ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload verified release bundle artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: |
+            dist/scarab.exe
+            dist/scarab.exe.sha256
+            dist/scarab.exe.virustotal.json
+            dist/THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish immutable GitHub release
+    needs: virustotal
+    runs-on: windows-2025
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified release bundle artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: dist
+
+      - name: Validate release bundle hashes and provenance
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $expectedFileNames = @("scarab.exe", "scarab.exe.sha256", "scarab.exe.virustotal.json", "THIRD_PARTY_LICENSES.html")
+          $files = @(Get-ChildItem -Path $dist -File)
+          if ($files.Count -ne 4) {
+            throw "Verified release bundle must contain exactly four files."
+          }
+          foreach ($file in $files) {
+            if ($expectedFileNames -notcontains $file.Name) {
+              throw "Verified release bundle contains unexpected file '$($file.Name)'."
+            }
+          }
+
+          $exe = Join-Path $dist "scarab.exe"
+          $checksumPath = Join-Path $dist "scarab.exe.sha256"
+          $virusTotalPath = Join-Path $dist "scarab.exe.virustotal.json"
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+          $exeSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $licenseBundleSha256 = (Get-FileHash -LiteralPath $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $licenseBundleSize = [int64](Get-Item -LiteralPath $licenseBundlePath).Length
+          $checksumContent = Get-Content -Path $checksumPath -Raw -Encoding ascii
+          if ($checksumContent -cnotmatch '^([0-9a-f]{64})  scarab\.exe$' -or $Matches[1] -cne $exeSha256) {
+            throw "Release checksum did not match scarab.exe."
+          }
+
+          $virusTotalManifest = Get-Content -Path $virusTotalPath -Raw | ConvertFrom-Json
+          if ($virusTotalManifest.schema_version -ne 2 -or
+              $virusTotalManifest.release_branch -cne $env:RELEASE_BRANCH -or
+              $virusTotalManifest.release_version -cne $env:RELEASE_VERSION -or
+              $virusTotalManifest.source_sha -cne $env:SOURCE_SHA -or
+              $virusTotalManifest.sha256 -cne $exeSha256 -or
+              $virusTotalManifest.third_party_licenses_sha256 -cne $licenseBundleSha256 -or
+              [int64]$virusTotalManifest.third_party_licenses_size -ne $licenseBundleSize -or
+              $virusTotalManifest.analysis_status -ne "completed" -or
+              $virusTotalManifest.stats.malicious -ne 0 -or
+              $virusTotalManifest.stats.suspicious -ne 0) {
+            throw "VirusTotal manifest did not match the verified release request and 0/0 gate."
+          }
+          if ([string]::IsNullOrWhiteSpace($virusTotalManifest.analysis_id)) {
+            throw "VirusTotal manifest analysis_id was empty."
+          }
+          $expectedReportUrl = "https://www.virustotal.com/gui/file/$exeSha256/detection"
+          if ($virusTotalManifest.report_url -cne $expectedReportUrl) {
+            throw "VirusTotal manifest report_url did not match the executable SHA-256."
+          }
+          "SIGNED_SHA256=$exeSha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "THIRD_PARTY_LICENSES_SHA256=$licenseBundleSha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "THIRD_PARTY_LICENSES_SIZE=$licenseBundleSize" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish immutable public release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          function Get-GitHubNextLink($Headers) {
+            if ($null -eq $Headers -or -not $Headers.ContainsKey("Link")) {
+              return $null
+            }
+
+            $linkHeader = ($Headers["Link"] -join ",")
+            foreach ($part in ($linkHeader -split ",")) {
+              if ($part -match '<([^>]+)>;\s*rel="next"') {
+                return $Matches[1]
+              }
+            }
+            return $null
+          }
+
+          function Invoke-GitHubJson($Method, $Uri, $BodyObject) {
+            $bodyJson = $null
+            if ($null -ne $BodyObject) {
+              $bodyJson = $BodyObject | ConvertTo-Json -Depth 10
+            }
+
+            try {
+              if ($null -eq $bodyJson) {
+                $response = Invoke-WebRequest `
+                  -Method $Method `
+                  -Uri $Uri `
+                  -Headers $headers `
+                  -MaximumRetryCount 3 `
+                  -RetryIntervalSec 10
+              } else {
+                $response = Invoke-WebRequest `
+                  -Method $Method `
+                  -Uri $Uri `
+                  -Headers $headers `
+                  -ContentType "application/json" `
+                  -Body $bodyJson `
+                  -MaximumRetryCount 3 `
+                  -RetryIntervalSec 10
+              }
+            } catch {
+              $statusCode = if ($null -ne $_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { "unknown" }
+              throw "GitHub $Method request failed for $Uri with HTTP status $statusCode."
+            }
+
+            if ([string]::IsNullOrWhiteSpace($response.Content)) {
+              return $null
+            }
+            return $response.Content | ConvertFrom-Json
+          }
+
+          function Invoke-GitHubGetAllowNotFound($Uri) {
+            try {
+              $response = Invoke-WebRequest `
+                -Method Get `
+                -Uri $Uri `
+                -Headers $headers `
+                -MaximumRetryCount 3 `
+                -RetryIntervalSec 10
+            } catch {
+              $statusCode = if ($null -ne $_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { "unknown" }
+              if ($statusCode -eq 404) {
+                return $null
+              }
+              throw "GitHub GET request failed for $Uri with HTTP status $statusCode."
+            }
+
+            if ([string]::IsNullOrWhiteSpace($response.Content)) {
+              return $null
+            }
+            return $response.Content | ConvertFrom-Json
+          }
+
+          function Resolve-GitObjectToCommit($GitObject) {
+            if ($null -eq $GitObject) {
+              throw "Git object was null while resolving the release tag."
+            }
+
+            $currentObject = $GitObject
+            for ($depth = 0; $depth -lt 8; $depth++) {
+              if ($currentObject.sha -cnotmatch '^[0-9a-f]{40}$') {
+                throw "Git object SHA '$($currentObject.sha)' was not a 40-character lowercase commit identifier."
+              }
+              if ($currentObject.type -eq "commit") {
+                return $currentObject.sha
+              }
+              if ($currentObject.type -ne "tag") {
+                throw "Git tag resolved to unsupported object type '$($currentObject.type)'."
+              }
+
+              $tagObject = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/git/tags/$($currentObject.sha)" $null
+              if ($null -eq $tagObject.object) {
+                throw "Annotated tag object '$($currentObject.sha)' did not contain a target object."
+              }
+              $currentObject = $tagObject.object
+            }
+
+            throw "Release tag did not resolve to a commit within the bounded eight-object peel limit."
+          }
+
+          function Invoke-GitHubDelete($Uri) {
+            try {
+              $response = Invoke-WebRequest `
+                -Method Delete `
+                -Uri $Uri `
+                -Headers $headers
+            } catch {
+              $statusCode = if ($null -ne $_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { "unknown" }
+              throw "GitHub DELETE request failed for $Uri with HTTP status $statusCode."
+            }
+
+            if ($response.StatusCode -ne 204) {
+              throw "GitHub DELETE request for $Uri returned HTTP status $($response.StatusCode), expected 204."
+            }
+          }
+
+          function Invoke-GitHubAssetUpload($Uri, $Asset) {
+            if (-not (Test-Path -Path $Asset.Path -PathType Leaf)) {
+              throw "Release asset '$($Asset.Name)' was not found at '$($Asset.Path)'."
+            }
+            if ([string]::IsNullOrWhiteSpace($Asset.ContentType)) {
+              throw "Release asset '$($Asset.Name)' did not define a content type."
+            }
+
+            $uploadUri = $null
+            if (-not [Uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$uploadUri)) {
+              throw "GitHub release asset upload URI for '$($Asset.Name)' was not a valid absolute URI."
+            }
+            if ($uploadUri.Scheme -ne "https" -or $uploadUri.Host -ne "uploads.github.com") {
+              throw "GitHub release asset upload URI for '$($Asset.Name)' must be an HTTPS uploads.github.com URI."
+            }
+
+            $fileStream = $null
+            $content = $null
+            $request = $null
+            $response = $null
+            try {
+              $fileStream = [System.IO.FileStream]::new($Asset.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+              if ([int64]$fileStream.Length -ne [int64]$Asset.Size) {
+                throw "Release asset '$($Asset.Name)' file length changed before upload."
+              }
+              $content = [System.Net.Http.StreamContent]::new($fileStream)
+              $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new($Asset.ContentType)
+              $content.Headers.ContentLength = [int64]$fileStream.Length
+
+              $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $uploadUri)
+              $request.Headers.Accept.Add([System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new("application/vnd.github+json"))
+              $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $env:GITHUB_TOKEN)
+              $request.Headers.Add("X-GitHub-Api-Version", "2026-03-10")
+              $request.Headers.UserAgent.ParseAdd("Scarab-Release-Publisher")
+              $request.Content = $content
+
+              $response = $uploadHttpClient.SendAsync($request).GetAwaiter().GetResult()
+              $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+              $statusCode = [int]$response.StatusCode
+
+              if ($response.StatusCode -ne [System.Net.HttpStatusCode]::Created) {
+                $githubMessage = $null
+                if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+                  try {
+                    $errorObject = $responseBody | ConvertFrom-Json
+                    if (-not [string]::IsNullOrWhiteSpace($errorObject.message)) {
+                      $githubMessage = $errorObject.message
+                    }
+                  } catch {
+                    $githubMessage = $null
+                  }
+                }
+
+                if ([string]::IsNullOrWhiteSpace($githubMessage)) {
+                  throw "GitHub release asset upload failed for '$($Asset.Name)' with HTTP status $statusCode."
+                }
+                throw "GitHub release asset upload failed for '$($Asset.Name)' with HTTP status ${statusCode}: $githubMessage"
+              }
+
+              if ([string]::IsNullOrWhiteSpace($responseBody)) {
+                throw "GitHub release asset upload for '$($Asset.Name)' returned HTTP 201 with an empty response body."
+              }
+
+              try {
+                return $responseBody | ConvertFrom-Json
+              } catch {
+                throw "GitHub release asset upload for '$($Asset.Name)' returned HTTP 201 but the response body was not valid JSON."
+              }
+            } catch {
+              $message = $_.Exception.Message
+              $exceptionType = $_.Exception.GetType().FullName
+              if ($message -like "GitHub release asset upload failed for '$($Asset.Name)' with HTTP status *" -or
+                  $message -like "GitHub release asset upload for '$($Asset.Name)' returned HTTP 201*" -or
+                  $message -like "Release asset '$($Asset.Name)' file length changed before upload.") {
+                throw
+              }
+              throw "GitHub release asset upload transport failed for '$($Asset.Name)': ${exceptionType}: $message"
+            } finally {
+              if ($null -ne $response) {
+                $response.Dispose()
+              }
+              if ($null -ne $request) {
+                $request.Dispose()
+              } elseif ($null -ne $content) {
+                $content.Dispose()
+              }
+              if ($null -ne $fileStream) {
+                $fileStream.Dispose()
+              }
+            }
+          }
+
+          function Get-PublicReleaseClassification([string]$TagName, [string]$ExpectedTitle, [string]$WorkflowMarker) {
+            $publishedMatches = @()
+            $workflowDrafts = @()
+            $conflictingDrafts = @()
+            $uri = "https://api.github.com/repos/$owner/$repo/releases?per_page=100"
+
+            while ($uri) {
+              try {
+                $response = Invoke-WebRequest `
+                  -Method Get `
+                  -Uri $uri `
+                  -Headers $headers `
+                  -MaximumRetryCount 3 `
+                  -RetryIntervalSec 10
+              } catch {
+                $statusCode = if ($null -ne $_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { "unknown" }
+                throw "GitHub release listing failed with HTTP status $statusCode."
+              }
+
+              $releases = $response.Content | ConvertFrom-Json
+              foreach ($release in @($releases)) {
+                $releaseBody = $release.body -as [string]
+
+                if ($release.draft -ne $true -and $release.tag_name -eq $TagName) {
+                  $publishedMatches += $release
+                  continue
+                }
+
+                if ($release.draft -eq $true -and $release.name -eq $ExpectedTitle) {
+                  if ($releaseBody -notlike "*$WorkflowMarker*") {
+                    $conflictingDrafts += $release
+                    continue
+                  }
+                  if ($release.prerelease -ne $false) {
+                    $conflictingDrafts += $release
+                    continue
+                  }
+                  $workflowDrafts += $release
+                }
+              }
+              $uri = Get-GitHubNextLink $response.Headers
+            }
+
+            return [pscustomobject]@{
+              PublishedMatches = @($publishedMatches)
+              WorkflowDrafts = @($workflowDrafts)
+              ConflictingDrafts = @($conflictingDrafts)
+            }
+          }
+
+          function Get-ReleaseAssets($ReleaseId) {
+            $assets = @()
+            $uri = "https://api.github.com/repos/$owner/$repo/releases/$ReleaseId/assets?per_page=100"
+
+            while ($uri) {
+              try {
+                $response = Invoke-WebRequest `
+                  -Method Get `
+                  -Uri $uri `
+                  -Headers $headers `
+                  -MaximumRetryCount 3 `
+                  -RetryIntervalSec 10
+              } catch {
+                $statusCode = if ($null -ne $_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { "unknown" }
+                throw "GitHub release asset listing failed with HTTP status $statusCode."
+              }
+
+              $pageAssets = $response.Content | ConvertFrom-Json
+              foreach ($asset in @($pageAssets)) {
+                $assets += $asset
+              }
+              $uri = Get-GitHubNextLink $response.Headers
+            }
+
+            return @($assets)
+          }
+
+          function Assert-WorkflowOwnedDraft($Release, [string]$ExpectedTitle, [string]$ExpectedBody) {
+            if ($Release.draft -ne $true) {
+              throw "Release '$env:RELEASE_BRANCH' is not a draft; refusing draft mutation."
+            }
+            if ($Release.prerelease -ne $false) {
+              throw "Release '$env:RELEASE_BRANCH' is a prerelease; manual review is required."
+            }
+            if (($Release.body -as [string]) -notlike "*$workflowMarker*") {
+              throw "Draft release '$env:RELEASE_BRANCH' is not marked as workflow-owned; refusing mutation."
+            }
+            if ($Release.name -ne $ExpectedTitle) {
+              throw "Draft release name was '$($Release.name)', expected '$ExpectedTitle'."
+            }
+            if (($Release.body -as [string]) -ne $ExpectedBody) {
+              throw "Draft release body does not match the deterministic workflow body."
+            }
+             if ([string]::IsNullOrWhiteSpace($Release.upload_url)) {
+               throw "Draft release '$env:RELEASE_BRANCH' did not include an upload_url."
+             }
+             Write-Host "Validated workflow-owned draft release ID $($Release.id) for source $env:SOURCE_SHA with current temporary tag_name '$($Release.tag_name)'."
+          }
+
+          function Assert-DuplicateWorkflowOwnedDraft($Release, [string]$ExpectedTitle) {
+            if ($Release.draft -ne $true) {
+              throw "Duplicate release candidate '$($Release.id)' is not a draft; refusing deletion."
+            }
+            if ($Release.prerelease -ne $false) {
+              throw "Duplicate release candidate '$($Release.id)' is a prerelease; refusing deletion."
+            }
+            if ($Release.name -ne $ExpectedTitle) {
+              throw "Duplicate release candidate '$($Release.id)' name was '$($Release.name)', expected '$ExpectedTitle'."
+            }
+             if (($Release.body -as [string]) -notlike "*$workflowMarker*") {
+               throw "Duplicate release candidate '$($Release.id)' is not marked as workflow-owned; refusing deletion."
+             }
+             if (($Release.body -as [string]) -notlike "*- Source commit: $env:SOURCE_SHA*") {
+               throw "Duplicate release candidate '$($Release.id)' is not bound to source $env:SOURCE_SHA; refusing deletion."
+             }
+           }
+
+          function Assert-ReleaseAssetSet($Assets, $ExpectedAssets, [string]$Context) {
+            if ($Assets.Count -ne $ExpectedAssets.Count) {
+              throw "$Context must contain exactly $($ExpectedAssets.Count) assets, found $($Assets.Count)."
+            }
+
+            $groups = $Assets | Group-Object -Property name
+            foreach ($group in $groups) {
+              if ($group.Count -ne 1) {
+                throw "$Context contains duplicate asset name '$($group.Name)'."
+              }
+            }
+
+            foreach ($asset in $Assets) {
+              if (-not $ExpectedAssets.ContainsKey($asset.name)) {
+                throw "$Context contains unexpected asset '$($asset.name)'."
+              }
+              if ($asset.state -ne "uploaded") {
+                throw "$Context asset '$($asset.name)' state was '$($asset.state)', expected 'uploaded'."
+              }
+
+              $expected = $ExpectedAssets[$asset.name]
+              if ([int64]$asset.size -ne [int64]$expected.Size) {
+                throw "$Context asset '$($asset.name)' size was $($asset.size), expected $($expected.Size)."
+              }
+
+              $expectedDigest = "sha256:$($expected.Sha256)"
+              if ([string]::IsNullOrWhiteSpace($asset.digest)) {
+                throw "$Context asset '$($asset.name)' did not include a digest."
+              }
+              if ($asset.digest.ToLowerInvariant() -ne $expectedDigest) {
+                throw "$Context asset '$($asset.name)' digest was '$($asset.digest)', expected '$expectedDigest'."
+              }
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+            throw "The workflow GITHUB_TOKEN is required for public release publication."
+          }
+          if ($env:RELEASE_BRANCH -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "RELEASE_BRANCH must match vMAJOR.MINOR.PATCH before public release publication."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
+            throw "RELEASE_VERSION is required before public release publication."
+          }
+          if ($env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$') {
+            throw "SOURCE_SHA must be a 40-character lowercase hexadecimal commit SHA before public release publication."
+          }
+          if ($env:SIGNED_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "SIGNED_SHA256 must be a 64-character lowercase hexadecimal SHA-256 digest before public release publication."
+          }
+          if ($env:THIRD_PARTY_LICENSES_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "THIRD_PARTY_LICENSES_SHA256 must be a 64-character lowercase hexadecimal SHA-256 digest before public release publication."
+          }
+          $expectedLicenseBundleSize = 0L
+          if (-not [int64]::TryParse($env:THIRD_PARTY_LICENSES_SIZE, [ref]$expectedLicenseBundleSize) -or
+              $expectedLicenseBundleSize -le 0) {
+            throw "THIRD_PARTY_LICENSES_SIZE must be a positive integer before public release publication."
+          }
+
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          if (-not (Test-Path -Path $dist -PathType Container)) {
+            throw "dist directory was not found."
+          }
+
+          $expectedFileNames = @("scarab.exe", "scarab.exe.sha256", "scarab.exe.virustotal.json", "THIRD_PARTY_LICENSES.html")
+          $distFiles = @(Get-ChildItem -Path $dist -File)
+          if ($distFiles.Count -ne 4) {
+            throw "dist must contain exactly four release files before public publication."
+          }
+          foreach ($fileName in $expectedFileNames) {
+            $path = Join-Path $dist $fileName
+            if (-not (Test-Path -Path $path -PathType Leaf)) {
+              throw "Required release file '$fileName' was not found in dist."
+            }
+          }
+          foreach ($file in $distFiles) {
+            if ($expectedFileNames -notcontains $file.Name) {
+              throw "dist contains unexpected release file '$($file.Name)'."
+            }
+          }
+
+          $exePath = Join-Path $dist "scarab.exe"
+          $checksumPath = Join-Path $dist "scarab.exe.sha256"
+          $virusTotalPath = Join-Path $dist "scarab.exe.virustotal.json"
+          $licenseBundlePath = Join-Path $dist "THIRD_PARTY_LICENSES.html"
+
+          $exeHash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumHash = (Get-FileHash -Path $checksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $virusTotalHash = (Get-FileHash -Path $virusTotalPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $licenseBundleHash = (Get-FileHash -LiteralPath $licenseBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $licenseBundleSize = [int64](Get-Item -LiteralPath $licenseBundlePath).Length
+          if ($exeHash -cne $env:SIGNED_SHA256) {
+            throw "dist/scarab.exe SHA-256 $exeHash did not match SIGNED_SHA256 $env:SIGNED_SHA256."
+          }
+          if ($licenseBundleHash -cne $env:THIRD_PARTY_LICENSES_SHA256 -or
+              $licenseBundleSize -ne $expectedLicenseBundleSize) {
+            throw "dist/THIRD_PARTY_LICENSES.html did not match its validated release provenance."
+          }
+
+          $checksumContent = Get-Content -Path $checksumPath -Raw -Encoding ascii
+          if ($checksumContent -cnotmatch '^([0-9a-f]{64})  scarab\.exe$') {
+            throw "dist/scarab.exe.sha256 did not match the exact expected checksum format."
+          }
+          if ($Matches[1] -cne $env:SIGNED_SHA256) {
+            throw "dist/scarab.exe.sha256 digest did not match SIGNED_SHA256."
+          }
+
+          $virusTotalManifest = Get-Content -Path $virusTotalPath -Raw | ConvertFrom-Json
+          if ($virusTotalManifest.schema_version -ne 2) {
+            throw "VirusTotal manifest schema_version was not 2."
+          }
+          if ($virusTotalManifest.release_branch -ne $env:RELEASE_BRANCH) {
+            throw "VirusTotal manifest release_branch did not match RELEASE_BRANCH."
+          }
+          if ($virusTotalManifest.release_version -ne $env:RELEASE_VERSION) {
+            throw "VirusTotal manifest release_version did not match RELEASE_VERSION."
+          }
+          if ($virusTotalManifest.source_sha -cne $env:SOURCE_SHA) {
+            throw "VirusTotal manifest source_sha did not match SOURCE_SHA."
+          }
+          if ($virusTotalManifest.sha256 -cne $env:SIGNED_SHA256) {
+            throw "VirusTotal manifest sha256 did not match SIGNED_SHA256."
+          }
+          if ($virusTotalManifest.third_party_licenses_sha256 -cne $licenseBundleHash -or
+              [int64]$virusTotalManifest.third_party_licenses_size -ne $licenseBundleSize) {
+            throw "VirusTotal manifest third-party license bundle provenance did not match the release file."
+          }
+          if ($virusTotalManifest.analysis_status -ne "completed") {
+            throw "VirusTotal manifest analysis_status was not completed."
+          }
+          if ($virusTotalManifest.stats.malicious -ne 0) {
+            throw "VirusTotal manifest malicious count was not zero."
+          }
+          if ($virusTotalManifest.stats.suspicious -ne 0) {
+            throw "VirusTotal manifest suspicious count was not zero."
+          }
+          if ([string]::IsNullOrWhiteSpace($virusTotalManifest.analysis_id)) {
+            throw "VirusTotal manifest analysis_id was empty."
+          }
+
+          $reportUrl = "https://www.virustotal.com/gui/file/$($env:SIGNED_SHA256)/detection"
+          if ($virusTotalManifest.report_url -ne $reportUrl) {
+            throw "VirusTotal manifest report_url did not match the expected signed SHA-256 report URL."
+          }
+
+          $releaseAssets = @(
+            [pscustomobject]@{
+              Name = "scarab.exe"
+              Path = $exePath
+              Size = (Get-Item -Path $exePath).Length
+              Sha256 = $exeHash
+              ContentType = "application/octet-stream"
+            }
+            [pscustomobject]@{
+              Name = "scarab.exe.sha256"
+              Path = $checksumPath
+              Size = (Get-Item -Path $checksumPath).Length
+              Sha256 = $checksumHash
+              ContentType = "text/plain"
+            }
+            [pscustomobject]@{
+              Name = "scarab.exe.virustotal.json"
+              Path = $virusTotalPath
+              Size = (Get-Item -Path $virusTotalPath).Length
+              Sha256 = $virusTotalHash
+              ContentType = "application/json"
+            }
+            [pscustomobject]@{
+              Name = "THIRD_PARTY_LICENSES.html"
+              Path = $licenseBundlePath
+              Size = $licenseBundleSize
+              Sha256 = $licenseBundleHash
+              ContentType = "text/html"
+            }
+          )
+
+          $expectedAssetMap = @{}
+          foreach ($asset in $releaseAssets) {
+            $expectedAssetMap[$asset.Name] = $asset
+          }
+
+          $owner = "FiendishDrWu"
+          $repo = "Scarab"
+          $targetFullName = "$owner/$repo"
+          $workflowMarker = "<!-- scarab-release-publisher:v2 -->"
+          $releaseTitle = "Scarab $env:RELEASE_BRANCH"
+          $releaseBody = @"
+          $workflowMarker
+
+          Scarab $env:RELEASE_BRANCH
+
+          Signed Windows x64 release of Scarab, an asset catalog generator for MechWarrior 5: Mercenaries.
+
+          Scarab generates deterministic item, mech, trait, and stock-template catalogs from a local MW5 installation and its enabled mods.
+
+          ## Verification
+
+          - Authenticode signed release executable
+          - Source commit: $env:SOURCE_SHA
+          - SHA-256: ``$env:SIGNED_SHA256``
+          - Third-party license bundle SHA-256: ``$env:THIRD_PARTY_LICENSES_SHA256``
+          - VirusTotal release scan: 0 malicious / 0 suspicious
+          - VirusTotal report: $reportUrl
+
+          ## Files
+
+          - ``scarab.exe``
+          - ``scarab.exe.sha256``
+          - ``scarab.exe.virustotal.json``
+          - ``THIRD_PARTY_LICENSES.html``
+          "@
+
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "Authorization" = "Bearer $env:GITHUB_TOKEN"
+            "X-GitHub-Api-Version" = "2026-03-10"
+            "User-Agent" = "Scarab-Release-Publisher"
+          }
+
+          $repository = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo" $null
+          if ($repository.full_name -ne $targetFullName) {
+            throw "Public release repository full_name was '$($repository.full_name)', expected '$targetFullName'."
+          }
+          if ($repository.private -ne $false) {
+            throw "Public release repository '$targetFullName' must be public."
+          }
+          if ([string]::IsNullOrWhiteSpace($repository.default_branch)) {
+            throw "Public release repository '$targetFullName' did not report a default branch."
+          }
+          if ($repository.default_branch -cne "main") {
+            throw "Public release repository default branch was '$($repository.default_branch)', expected 'main'."
+          }
+
+          $defaultBranch = $repository.default_branch
+          $headRef = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/git/ref/heads/$defaultBranch" $null
+          $expectedHeadRefName = "refs/heads/$defaultBranch"
+          if ($headRef.ref -ne $expectedHeadRefName) {
+            throw "Public default branch ref was '$($headRef.ref)', expected '$expectedHeadRefName'."
+          }
+          if ($headRef.object.type -ne "commit") {
+            throw "Public default branch ref object type was '$($headRef.object.type)', expected 'commit'."
+          }
+          if ($headRef.object.sha -cnotmatch '^[0-9a-f]{40}$') {
+            throw "Public default branch HEAD did not report a 40-character commit SHA."
+          }
+          if ($headRef.object.sha -cne $env:SOURCE_SHA) {
+            throw "Public main moved to $($headRef.object.sha) before publication; expected source commit $env:SOURCE_SHA."
+          }
+          $targetCommitSha = $env:SOURCE_SHA
+
+          $sourceCommit = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/git/commits/$targetCommitSha" $null
+          if ($sourceCommit.sha -cne $targetCommitSha) {
+            throw "GitHub source commit lookup returned '$($sourceCommit.sha)', expected '$targetCommitSha'."
+          }
+          if (@($sourceCommit.parents).Count -ne 0) {
+            throw "Public source commit $targetCommitSha must remain a parentless root commit."
+          }
+
+          $classification = Get-PublicReleaseClassification $env:RELEASE_BRANCH $releaseTitle $workflowMarker
+          if ($classification.PublishedMatches.Count -gt 1) {
+            throw "Multiple published public releases already use tag '$env:RELEASE_BRANCH'; manual review is required."
+          }
+          if ($classification.PublishedMatches.Count -eq 1) {
+            throw "Public release $env:RELEASE_BRANCH is already published; refusing to edit or replace it."
+          }
+           if ($classification.ConflictingDrafts.Count -gt 0) {
+             $conflictingIds = ($classification.ConflictingDrafts | ForEach-Object { $_.id }) -join ", "
+             throw "Found conflicting draft public release(s) for '$releaseTitle' requiring manual review: $conflictingIds."
+           }
+           foreach ($draft in @($classification.WorkflowDrafts)) {
+             if (($draft.body -as [string]) -notlike "*- Source commit: $env:SOURCE_SHA*") {
+               throw "Workflow-owned draft release $($draft.id) is not bound to public source commit $env:SOURCE_SHA; refusing mutation."
+             }
+           }
+
+           $tagRef = Invoke-GitHubGetAllowNotFound "https://api.github.com/repos/$owner/$repo/git/ref/tags/$($env:RELEASE_BRANCH)"
+          if ($null -ne $tagRef) {
+            throw "Public tag '$env:RELEASE_BRANCH' already exists without a matching published release; refusing to reuse or overwrite it."
+          }
+
+          $workflowDrafts = @($classification.WorkflowDrafts)
+          if ($workflowDrafts.Count -eq 0) {
+            $createBody = [ordered]@{
+              tag_name = $env:RELEASE_BRANCH
+              target_commitish = $targetCommitSha
+              name = $releaseTitle
+              body = $releaseBody
+              draft = $true
+              prerelease = $false
+              generate_release_notes = $false
+            }
+
+            $draftRelease = Invoke-GitHubJson Post "https://api.github.com/repos/$owner/$repo/releases" $createBody
+            if ([string]::IsNullOrWhiteSpace($draftRelease.id)) {
+              throw "Created draft release did not report a release ID."
+            }
+            Assert-WorkflowOwnedDraft $draftRelease $releaseTitle $releaseBody
+            $releaseId = $draftRelease.id
+            $uploadUrl = $draftRelease.upload_url
+            Write-Host "Created workflow-owned draft public release $releaseTitle."
+          } else {
+            $orderedDrafts = @($workflowDrafts | Sort-Object -Property @{ Expression = { [int64]$_.id }; Ascending = $true })
+            $canonicalDraft = $orderedDrafts[0]
+            $canonicalReleaseId = [int64]$canonicalDraft.id
+
+            if ($orderedDrafts.Count -gt 1) {
+              $duplicateDrafts = @($orderedDrafts | Select-Object -Skip 1)
+              $duplicateIds = ($duplicateDrafts | ForEach-Object { $_.id }) -join ", "
+              Write-Host "Reconciling duplicate workflow-owned draft release(s) for ${releaseTitle}: $duplicateIds."
+
+              foreach ($duplicateDraft in $duplicateDrafts) {
+                $duplicateRelease = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/releases/$($duplicateDraft.id)" $null
+                Assert-DuplicateWorkflowOwnedDraft $duplicateRelease $releaseTitle
+                Invoke-GitHubDelete "https://api.github.com/repos/$owner/$repo/releases/$($duplicateRelease.id)"
+                Write-Host "Deleted duplicate workflow-owned draft release ID $($duplicateRelease.id)."
+              }
+
+              $classification = Get-PublicReleaseClassification $env:RELEASE_BRANCH $releaseTitle $workflowMarker
+              if ($classification.PublishedMatches.Count -gt 0) {
+                throw "Public release $env:RELEASE_BRANCH became published during draft reconciliation; refusing to continue."
+              }
+              if ($classification.ConflictingDrafts.Count -gt 0) {
+                $conflictingIds = ($classification.ConflictingDrafts | ForEach-Object { $_.id }) -join ", "
+                throw "Found conflicting draft public release(s) for '$releaseTitle' after duplicate reconciliation: $conflictingIds."
+              }
+
+              $remainingDrafts = @($classification.WorkflowDrafts | Sort-Object -Property @{ Expression = { [int64]$_.id }; Ascending = $true })
+              if ($remainingDrafts.Count -ne 1) {
+                throw "Expected exactly one workflow-owned draft release after duplicate reconciliation, found $($remainingDrafts.Count)."
+              }
+              if ([int64]$remainingDrafts[0].id -ne $canonicalReleaseId) {
+                throw "Canonical workflow-owned draft release ID changed during duplicate reconciliation."
+              }
+              $canonicalDraft = $remainingDrafts[0]
+            }
+
+            $releaseId = $canonicalDraft.id
+            $updateBody = [ordered]@{
+              tag_name = $env:RELEASE_BRANCH
+              target_commitish = $targetCommitSha
+              name = $releaseTitle
+              body = $releaseBody
+              draft = $true
+              prerelease = $false
+            }
+            Invoke-GitHubJson Patch "https://api.github.com/repos/$owner/$repo/releases/$releaseId" $updateBody | Out-Null
+            $draftRelease = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/releases/$releaseId" $null
+            Assert-WorkflowOwnedDraft $draftRelease $releaseTitle $releaseBody
+            $uploadUrl = $draftRelease.upload_url
+            Write-Host "Resuming workflow-owned draft public release $releaseTitle using release ID $releaseId."
+          }
+
+          $draftRelease = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/releases/$releaseId" $null
+          Assert-WorkflowOwnedDraft $draftRelease $releaseTitle $releaseBody
+
+          $existingAssets = Get-ReleaseAssets $releaseId
+          foreach ($asset in $existingAssets) {
+            Invoke-GitHubDelete "https://api.github.com/repos/$owner/$repo/releases/assets/$($asset.id)"
+            Write-Host "Deleted draft asset '$($asset.name)' before fresh upload."
+          }
+
+          $remainingAssets = Get-ReleaseAssets $releaseId
+          if ($remainingAssets.Count -ne 0) {
+            throw "Workflow-owned draft release still contained assets after cleanup."
+          }
+
+          $uploadBase = $uploadUrl -replace '\{\?name,label\}$', ''
+          $uploadBaseUri = $null
+          if (-not [Uri]::TryCreate($uploadBase, [UriKind]::Absolute, [ref]$uploadBaseUri)) {
+            throw "GitHub release upload_url did not produce a valid absolute upload base URI."
+          }
+          if ($uploadBaseUri.Scheme -ne "https" -or $uploadBaseUri.Host -ne "uploads.github.com") {
+            throw "GitHub release upload_url must resolve to an HTTPS uploads.github.com URI."
+          }
+
+          $uploadHttpHandler = [System.Net.Http.HttpClientHandler]::new()
+          $uploadHttpHandler.AllowAutoRedirect = $false
+          $uploadHttpClient = [System.Net.Http.HttpClient]::new($uploadHttpHandler)
+          try {
+            foreach ($asset in $releaseAssets) {
+              $escapedName = [Uri]::EscapeDataString($asset.Name)
+              $assetUploadUrl = "${uploadBase}?name=$escapedName"
+              $assetUploadUri = $null
+              if (-not [Uri]::TryCreate($assetUploadUrl, [UriKind]::Absolute, [ref]$assetUploadUri)) {
+                throw "GitHub release asset upload URI for '$($asset.Name)' was not a valid absolute URI."
+              }
+              if ($assetUploadUri.Scheme -ne "https" -or $assetUploadUri.Host -ne "uploads.github.com") {
+                throw "GitHub release asset upload URI for '$($asset.Name)' must be an HTTPS uploads.github.com URI."
+              }
+
+              $uploaded = Invoke-GitHubAssetUpload $assetUploadUri.AbsoluteUri $asset
+
+              if ($uploaded.name -ne $asset.Name) {
+                throw "Uploaded asset name was '$($uploaded.name)', expected '$($asset.Name)'."
+              }
+              if ($uploaded.state -ne "uploaded") {
+                throw "Uploaded asset '$($asset.Name)' state was '$($uploaded.state)', expected 'uploaded'."
+              }
+              if ([int64]$uploaded.size -ne [int64]$asset.Size) {
+                throw "Uploaded asset '$($asset.Name)' size was $($uploaded.size), expected $($asset.Size)."
+              }
+              $expectedDigest = "sha256:$($asset.Sha256)"
+              if ([string]::IsNullOrWhiteSpace($uploaded.digest)) {
+                throw "Uploaded asset '$($asset.Name)' did not include a digest."
+              }
+              if ($uploaded.digest.ToLowerInvariant() -ne $expectedDigest) {
+                throw "Uploaded asset '$($asset.Name)' digest was '$($uploaded.digest)', expected '$expectedDigest'."
+              }
+
+              Write-Host "Uploaded $($asset.Name) ($($asset.Size) bytes, $expectedDigest)."
+            }
+          } finally {
+            $uploadHttpClient.Dispose()
+            $uploadHttpHandler.Dispose()
+          }
+
+          $draftAssets = Get-ReleaseAssets $releaseId
+          Assert-ReleaseAssetSet $draftAssets $expectedAssetMap "Draft public release"
+
+          $publishBody = [ordered]@{
+            tag_name = $env:RELEASE_BRANCH
+            target_commitish = $targetCommitSha
+            name = $releaseTitle
+            body = $releaseBody
+            draft = $false
+            prerelease = $false
+            make_latest = "true"
+          }
+          $publishedRelease = Invoke-GitHubJson Patch "https://api.github.com/repos/$owner/$repo/releases/$releaseId" $publishBody
+          if ($publishedRelease.draft -ne $false) {
+            throw "Published release still reported draft=true."
+          }
+          if ($publishedRelease.prerelease -ne $false) {
+            throw "Published release reported prerelease=true."
+          }
+          if ($publishedRelease.tag_name -ne $env:RELEASE_BRANCH) {
+            throw "Published release tag_name was '$($publishedRelease.tag_name)', expected '$env:RELEASE_BRANCH'."
+          }
+          if ($publishedRelease.target_commitish -cne $targetCommitSha) {
+            throw "Published release target_commitish was '$($publishedRelease.target_commitish)', expected '$targetCommitSha'."
+          }
+          if ($publishedRelease.name -ne $releaseTitle) {
+            throw "Published release name was '$($publishedRelease.name)', expected '$releaseTitle'."
+          }
+          if ([string]::IsNullOrWhiteSpace($publishedRelease.published_at)) {
+            throw "Published release did not report published_at."
+          }
+          if ([string]::IsNullOrWhiteSpace($publishedRelease.html_url)) {
+            throw "Published release did not report html_url."
+          }
+
+          $publishedRelease = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/releases/$releaseId" $null
+          if ($publishedRelease.draft -ne $false) {
+            throw "Final release validation found draft=true."
+          }
+          if ($publishedRelease.prerelease -ne $false) {
+            throw "Final release validation found prerelease=true."
+          }
+          if ($publishedRelease.tag_name -ne $env:RELEASE_BRANCH) {
+            throw "Final release validation tag_name was '$($publishedRelease.tag_name)', expected '$env:RELEASE_BRANCH'."
+          }
+          if ($publishedRelease.target_commitish -cne $targetCommitSha) {
+            throw "Final release target_commitish was '$($publishedRelease.target_commitish)', expected '$targetCommitSha'."
+          }
+          if ($publishedRelease.name -ne $releaseTitle) {
+            throw "Final release validation name was '$($publishedRelease.name)', expected '$releaseTitle'."
+          }
+          if (($publishedRelease.body -as [string]) -ne $releaseBody) {
+            throw "Final release validation body did not match the deterministic workflow body."
+          }
+          if ([string]::IsNullOrWhiteSpace($publishedRelease.published_at)) {
+            throw "Final release validation did not report published_at."
+          }
+          if ([string]::IsNullOrWhiteSpace($publishedRelease.html_url)) {
+            throw "Final release validation did not report html_url."
+          }
+          if ($publishedRelease.immutable -ne $true) {
+            throw "Published release '$releaseTitle' did not report immutable == true."
+          }
+
+          $publishedAssets = Get-ReleaseAssets $releaseId
+          Assert-ReleaseAssetSet $publishedAssets $expectedAssetMap "Immutable public release"
+
+          $publishedTagRef = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/git/ref/tags/$($env:RELEASE_BRANCH)" $null
+          $expectedTagRef = "refs/tags/$($env:RELEASE_BRANCH)"
+          if ($publishedTagRef.ref -ne $expectedTagRef) {
+            throw "Published tag ref was '$($publishedTagRef.ref)', expected '$expectedTagRef'."
+          }
+          $resolvedTagCommit = Resolve-GitObjectToCommit $publishedTagRef.object
+           if ($resolvedTagCommit -cne $targetCommitSha) {
+             throw "Published tag resolved to $resolvedTagCommit, expected exact source commit $targetCommitSha."
+           }
+
+           $finalMainRef = Invoke-GitHubJson Get "https://api.github.com/repos/$owner/$repo/git/ref/heads/main" $null
+           if ($finalMainRef.ref -cne "refs/heads/main" -or
+               $finalMainRef.object.type -cne "commit" -or
+               $finalMainRef.object.sha -cne $targetCommitSha) {
+             throw "Public main no longer points to immutable release source commit $targetCommitSha."
+           }
+
+           Write-Host "Published $releaseTitle at $($publishedRelease.html_url)."
+          Write-Host "Release tag: $env:RELEASE_BRANCH"
+          Write-Host "Release source commit: $resolvedTagCommit"
+          Write-Host "Signed Scarab SHA-256: $env:SIGNED_SHA256"
+          Write-Host "Third-party license bundle SHA-256: $env:THIRD_PARTY_LICENSES_SHA256"
+          Write-Host "VirusTotal release scan: 0 malicious / 0 suspicious"
+          Write-Host "GitHub release immutable: $($publishedRelease.immutable)"
+
+          @(
+            "## Public Scarab release"
+            ""
+            "Release: $releaseTitle"
+            ""
+            "Tag: ``$env:RELEASE_BRANCH``"
+            ""
+            "Source commit: ``$resolvedTagCommit``"
+            ""
+            "Signed SHA-256: ``$env:SIGNED_SHA256``"
+            ""
+            "Third-party licenses SHA-256: ``$env:THIRD_PARTY_LICENSES_SHA256``"
+            ""
+            "VirusTotal: 0 malicious / 0 suspicious"
+            ""
+            "Immutable: ``true``"
+            ""
+            "[GitHub Release]($($publishedRelease.html_url))"
+            ""
+            "[VirusTotal report]($reportUrl)"
+            ""
+          ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY
